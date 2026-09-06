@@ -341,9 +341,25 @@ H3MemoryBackend::H3MemoryBackend(unsigned partition_id,
   // per-cube buffer would. See LhbConfig::address_interleave_factor.
   lcfg.address_interleave_factor = m_num_partitions;
 
-  m_fill_engine.reset(new AnalyticFillEngine(lcfg.hbf_read_latency_ps(),
-                                             lcfg.hbf_bandwidth_gbps));
+#ifdef H3_WITH_RAMULATOR
+  if (m_hbf_device->is_async()) {
+    // Prefetch fills go through the SAME device as demand traffic, so the model
+    // sees the real request stream: bank conflicts between fills and demands,
+    // row-buffer reuse, queueing. Timing them separately would make the two
+    // paths disagree about the same memory.
+    m_fill_engine = make_ramulator_fill_engine(
+        m_hbf_device.get(), /*sector=*/32, lcfg.hbf_read_latency_ns,
+        lcfg.hbf_bandwidth_gbps,
+        [this](uint64_t token, uint64_t now) { this->on_async_completion(token, now); });
+  }
+#endif
+  if (!m_fill_engine) {
+    m_fill_engine.reset(new AnalyticFillEngine(lcfg.hbf_read_latency_ps(),
+                                               lcfg.hbf_bandwidth_gbps));
+  }
   m_lhb.reset(new LatencyHidingBuffer(lcfg, m_fill_engine.get()));
+  m_lhb->set_fill_complete_handler(
+      [this](int half, uint64_t now) { this->on_fill_complete(half, now); });
 
   // ---- Prefetch scheduler ----------------------------------------------
   if (m_config.enable_prefetch_scheduler && !m_config.model_config.empty()) {
@@ -367,7 +383,10 @@ bool H3MemoryBackend::devices_can_accept(bool is_write) const {
 }
 
 bool H3MemoryBackend::full(bool is_write) const {
-  if (m_pending.size() + m_async_pending.size() >= m_config.request_queue_size)
+  size_t waiting = 0;
+  for (const auto& kv : m_fill_waiters) waiting += kv.second.size();
+  if (m_pending.size() + m_async_pending.size() + waiting >=
+      m_config.request_queue_size)
     return true;
   if (m_async_done.size() >= m_config.return_queue_size) return true;
   if (m_return_queue.size() >= m_config.return_queue_size) return true;
@@ -412,6 +431,17 @@ void H3MemoryBackend::push(const H3MemRequest& req) {
       // prefetched, the access costs SRAM latency instead of ~20 us; the
       // router has already charged the D2D hop in d.issue_time_ps.
       const LhbAccess a = m_lhb->access(d.local_addr, r.size_bytes, d.issue_time_ps);
+      if (a.waiting_on_fill) {
+        // Coalesced onto a fill still in flight. No ready time exists yet;
+        // park it until that fill lands.
+        Pending w;
+        w.issue_ps = now;
+        w.ready_ps = 0;
+        w.opaque = req.opaque;
+        w.is_write = req.is_write;
+        m_fill_waiters[a.half].push_back(w);
+        return;
+      }
       if (a.outcome == LhbOutcome::Hit) {
         // Served from SRAM: the HBF device is not touched at all.
         ready_ps = a.ready_time_ps;
@@ -500,6 +530,19 @@ void H3MemoryBackend::push(const H3MemRequest& req) {
 
 bool H3MemoryBackend::decode_region_is_hbf(uint64_t addr) const {
   return m_router->decode(addr) == MemRegion::Hbf;
+}
+
+void H3MemoryBackend::on_fill_complete(int half, uint64_t now_ps) {
+  auto it = m_fill_waiters.find(half);
+  if (it == m_fill_waiters.end()) return;
+  const uint64_t sram = m_lhb->config().sram_access_latency_ps();
+  for (Pending& p : it->second) {
+    p.ready_ps = std::max(now_ps + sram, p.issue_ps);
+    // Now that the true wait is known, charge it to the buffer's statistics.
+    m_lhb->record_deferred_stall(p.ready_ps - p.issue_ps);
+    m_async_done.push_back(p);
+  }
+  m_fill_waiters.erase(it);
 }
 
 void H3MemoryBackend::on_async_completion(uint64_t token, uint64_t now_ps) {

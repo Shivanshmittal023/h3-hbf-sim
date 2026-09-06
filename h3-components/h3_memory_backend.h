@@ -142,10 +142,21 @@ class IH3MemoryDevice {
 };
 
 #ifdef H3_WITH_RAMULATOR
-// Defined in h3_ramulator_device.cpp. Wraps a Ramulator 2.1 memory system
-// (ExternalFrontEnd + IMemorySystem) behind IH3MemoryDevice.
+// Both defined in h3_ramulator_device.cpp. They wrap a Ramulator 2.1 memory
+// system (ExternalFrontEnd + IMemorySystem) behind the two H3 interfaces.
 std::unique_ptr<IH3MemoryDevice> make_ramulator_device(const std::string& config_path,
                                                        const char* name);
+
+// An LHB fill engine backed by an existing Ramulator device, so PREFETCH
+// traffic is timed by the same model as demand traffic. Without this, the ~99.9%
+// of HBF reads that the buffer serves would still be closed-form.
+// `demand_handler` is the backend's own completion handler. The engine takes
+// over the device's callback (it must see every sector), so it needs somewhere
+// to forward completions that belong to demand requests rather than fills.
+// Passing it in makes that hand-off explicit and impossible to forget.
+std::unique_ptr<ILhbFillEngine> make_ramulator_fill_engine(
+    IH3MemoryDevice* device, uint32_t sector_bytes, double fallback_latency_ns,
+    double fallback_bw_gbps, IH3MemoryDevice::CompletionHandler demand_handler);
 #endif
 
 // Closed-form device: completion = max(now, next_free) + latency, with the
@@ -322,6 +333,9 @@ class H3MemoryBackend {
   };
 
   void on_async_completion(uint64_t token, uint64_t now_ps);
+  // Called when an LHB half's asynchronous fill lands: releases every request
+  // that coalesced onto it.
+  void on_fill_complete(int half, uint64_t now_ps);
 
   // Adapters letting the router push into IH3MemoryDevice instances.
   class DeviceBackendAdapter;
@@ -354,6 +368,10 @@ class H3MemoryBackend {
   // known at push, so they cannot live in the ready-time-ordered deque above;
   // the device's callback moves them into m_async_done.
   std::unordered_map<uint64_t, Pending> m_async_pending;
+  // Requests that hit a half whose fill was still in flight. They cannot be
+  // given a ready time yet, so they wait here, keyed by half index, and are
+  // released together when that fill lands. This is MSHR-style coalescing.
+  std::unordered_map<int, std::vector<Pending>> m_fill_waiters;
   std::deque<Pending> m_async_done;
   uint64_t m_next_token = 1;
   std::deque<void*> m_return_queue;   // completed, awaiting the partition

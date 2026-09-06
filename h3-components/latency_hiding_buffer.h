@@ -68,6 +68,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <iosfwd>
 #include <string>
 #include <vector>
@@ -117,6 +118,16 @@ struct LhbAccess {
   uint64_t ready_time_ps = 0;  // when the data is available to the GPU
   uint64_t stall_ps = 0;       // ready_time_ps - request time (0 on a hit)
   int half = -1;               // which half served it, or -1
+
+  // Set when the fill engine is ASYNCHRONOUS and the half this access needs is
+  // still filling. The completion time is not knowable yet, so ready_time_ps
+  // and stall_ps are meaningless: the caller must park the request and wait for
+  // the buffer's fill-complete callback for `half`.
+  //
+  // This is request coalescing on an outstanding fill -- the same MSHR merging
+  // real hardware does. Issuing a second fetch for data already in flight would
+  // both double-count HBF traffic and misreport latency.
+  bool waiting_on_fill = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -130,6 +141,7 @@ class ILhbFillEngine {
   virtual ~ILhbFillEngine() = default;
 
   // Begin a fill. Returns the absolute time at which the data is complete.
+  // Only meaningful for synchronous engines (is_async() == false).
   virtual uint64_t start_fill(uint64_t hbf_addr, uint64_t size_bytes,
                               uint64_t now_ps) = 0;
 
@@ -137,6 +149,29 @@ class ILhbFillEngine {
   virtual uint64_t demand_latency_ps(uint64_t size_bytes, uint64_t now_ps) = 0;
 
   virtual const char* name() const = 0;
+
+  // ---- Asynchronous fills ------------------------------------------------
+  // A closed-form engine knows when a fill lands the moment it starts. A real
+  // memory model does not -- the answer depends on queueing and arbitration
+  // that have not happened yet, and arrives later via callback.
+  //
+  // Engines that work that way report is_async() == true. The buffer then uses
+  // start_fill_async() and marks the half Ready only when the callback fires,
+  // rather than at a precomputed time.
+  virtual bool is_async() const { return false; }
+
+  using FillCompletionHandler =
+      std::function<void(uint64_t token, uint64_t now_ps)>;
+  virtual void set_completion_handler(FillCompletionHandler /*handler*/) {}
+
+  // Returns false if the fill could not be issued; the buffer retries later.
+  virtual bool start_fill_async(uint64_t /*hbf_addr*/, uint64_t /*size_bytes*/,
+                                uint64_t /*now_ps*/, uint64_t /*token*/) {
+    return false;
+  }
+
+  // Advance the engine's own clock (no-op for closed-form engines).
+  virtual void tick(uint64_t /*now_ps*/) {}
 };
 
 // Closed-form engine: completion = now + tR + size / bandwidth.
@@ -278,6 +313,18 @@ class LatencyHidingBuffer {
   // The GPU reads `size_bytes` at HBF-local `addr`.
   LhbAccess access(uint64_t addr, uint64_t size_bytes, uint64_t now_ps);
 
+  // --- Asynchronous fills --------------------------------------------------
+  // Invoked when a half's fill lands, so the backend can release any requests
+  // it parked on that half (see LhbAccess::waiting_on_fill).
+  using FillCompleteHandler = std::function<void(int half, uint64_t now_ps)>;
+  void set_fill_complete_handler(FillCompleteHandler handler) {
+    m_fill_complete_handler = std::move(handler);
+  }
+
+  // Charge a stall to the statistics once its true length is known. Used by
+  // the backend for requests that waited on an asynchronous fill.
+  void record_deferred_stall(uint64_t stall_ps);
+
   // --- Introspection -------------------------------------------------------
   LhbState half_state(int half) const;
   bool is_resident(uint64_t addr, uint64_t size_bytes) const;
@@ -301,7 +348,9 @@ class LatencyHidingBuffer {
     uint64_t stored_bytes = 0;   // SRAM actually occupied (length / interleave)
     uint64_t consumed = 0;       // bytes already read by the GPU
     uint64_t fill_start_ps = 0;
-    uint64_t fill_done_ps = 0;
+    uint64_t fill_done_ps = 0;   // meaningless while an async fill is pending
+    bool async_fill_pending = false;
+    uint64_t fill_token = 0;
     int layer = -1;
 
     bool covers(uint64_t addr, uint64_t size) const {
@@ -333,6 +382,10 @@ class LatencyHidingBuffer {
   LhbStats m_stats;
   uint64_t m_last_occupancy_update_ps = 0;
   bool m_occupancy_started = false;
+  FillCompleteHandler m_fill_complete_handler;
+  uint64_t m_next_fill_token = 1;
+
+  void on_fill_complete(uint64_t token, uint64_t now_ps);
 };
 
 }  // namespace h3

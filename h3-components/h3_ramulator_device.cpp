@@ -50,6 +50,7 @@
 // ============================================================================
 
 #include "h3_memory_backend.h"
+#include "latency_hiding_buffer.h"
 
 #ifdef H3_WITH_RAMULATOR
 
@@ -260,7 +261,158 @@ class RamulatorMemoryDevice : public IH3MemoryDevice {
   uint64_t m_reads = 0, m_writes = 0, m_bytes = 0;
 };
 
+// ---------------------------------------------------------------------------
+//  Ramulator-backed LHB fill engine
+// ---------------------------------------------------------------------------
+//  A prefetch fill is a large sequential read (a 20 MiB half, or its
+//  1/N interleaved share). The memory system does not see "one 20 MiB request";
+//  it sees thousands of sector reads. This engine issues them that way, through
+//  the SAME device that serves demand traffic, so the model observes the real
+//  combined request stream -- fills and demands contending for the same banks,
+//  reusing the same open rows, sharing the same queues.
+//
+//  The fill completes when its LAST sector returns. That is the moment the
+//  buffer half genuinely holds all of its data.
+class RamulatorFillEngine : public ILhbFillEngine {
+ public:
+  RamulatorFillEngine(IH3MemoryDevice* device, uint32_t sector_bytes,
+                      double fallback_latency_ns, double fallback_bw_gbps,
+                      IH3MemoryDevice::CompletionHandler demand_handler)
+      : m_device(device),
+        m_demand_handler(std::move(demand_handler)),
+        m_sector(sector_bytes ? sector_bytes : 32),
+        m_fallback_latency_ps(
+            static_cast<uint64_t>(fallback_latency_ns * 1000.0 + 0.5)),
+        m_fallback_bytes_per_ps(fallback_bw_gbps * 1e-3) {
+    if (!m_device || !m_device->is_async()) {
+      throw std::runtime_error(
+          "RamulatorFillEngine requires an asynchronous device");
+    }
+    // Chain onto the device's completion handler: the backend also listens for
+    // demand completions, so both must be delivered.
+    m_device->set_completion_handler(
+        [this](uint64_t token, uint64_t now) { this->on_sector_done(token, now); });
+  }
+
+  bool is_async() const override { return true; }
+
+  void set_completion_handler(FillCompletionHandler handler) override {
+    m_fill_handler = std::move(handler);
+  }
+
+  bool start_fill_async(uint64_t hbf_addr, uint64_t size_bytes, uint64_t now_ps,
+                        uint64_t token) override {
+    const uint64_t sectors = (size_bytes + m_sector - 1) / m_sector;
+    if (sectors == 0) return false;
+
+    Fill f;
+    f.remaining = sectors;
+    f.issued = 0;
+    f.addr = hbf_addr;
+    f.size = size_bytes;
+    m_fills.emplace(token, f);
+
+    // Issue as many sectors as the device will take now; the rest go out from
+    // tick(). A fill must never be dropped because the device is momentarily
+    // full -- the buffer would wait forever for a completion that never comes.
+    issue_pending(token, now_ps);
+    return true;
+  }
+
+  void tick(uint64_t now_ps) override {
+    for (auto it = m_fills.begin(); it != m_fills.end();) {
+      const uint64_t token = it->first;
+      ++it;                       // issue_pending may erase the entry
+      issue_pending(token, now_ps);
+    }
+  }
+
+  // Only used if something asks a synchronous question of this engine. Fall
+  // back to the closed-form estimate rather than fabricating silence.
+  uint64_t start_fill(uint64_t /*hbf_addr*/, uint64_t size_bytes,
+                      uint64_t now_ps) override {
+    return now_ps + demand_latency_ps(size_bytes, now_ps);
+  }
+
+  uint64_t demand_latency_ps(uint64_t size_bytes, uint64_t /*now_ps*/) override {
+    return m_fallback_latency_ps +
+           static_cast<uint64_t>(static_cast<double>(size_bytes) /
+                                     m_fallback_bytes_per_ps + 0.5);
+  }
+
+  const char* name() const override { return "RamulatorFillEngine"; }
+
+ private:
+  struct Fill {
+    uint64_t remaining = 0;   // sectors not yet completed
+    uint64_t issued = 0;      // sectors handed to the device so far
+    uint64_t addr = 0;
+    uint64_t size = 0;
+  };
+
+  void issue_pending(uint64_t token, uint64_t now_ps) {
+    auto it = m_fills.find(token);
+    if (it == m_fills.end()) return;
+    Fill& f = it->second;
+    const uint64_t total = (f.size + m_sector - 1) / m_sector;
+
+    while (f.issued < total && m_device->can_accept(false)) {
+      const uint64_t sector_token = kSectorTokenBase + (m_next_sector++);
+      m_sector_owner[sector_token] = token;
+      if (!m_device->enqueue_async(f.addr + f.issued * m_sector, m_sector,
+                                   /*is_write=*/false, now_ps, sector_token)) {
+        m_sector_owner.erase(sector_token);
+        break;                    // retry from the next tick()
+      }
+      ++f.issued;
+    }
+  }
+
+  void on_sector_done(uint64_t token, uint64_t now_ps) {
+    auto owner = m_sector_owner.find(token);
+    if (owner == m_sector_owner.end()) {
+      // Not one of ours: it is a demand request the backend is waiting on.
+      if (m_demand_handler) m_demand_handler(token, now_ps);
+      return;
+    }
+    const uint64_t fill_token = owner->second;
+    m_sector_owner.erase(owner);
+
+    auto it = m_fills.find(fill_token);
+    if (it == m_fills.end()) return;
+    if (--it->second.remaining == 0) {
+      m_fills.erase(it);
+      // The whole half is resident only now, when its last sector has landed.
+      if (m_fill_handler) m_fill_handler(fill_token, now_ps);
+    }
+  }
+
+  // Sector tokens live above this base so they can never collide with the
+  // backend's demand tokens, which start at 1.
+  static constexpr uint64_t kSectorTokenBase = 1ULL << 48;
+
+  IH3MemoryDevice* m_device;
+  IH3MemoryDevice::CompletionHandler m_demand_handler;
+  uint32_t m_sector;
+  uint64_t m_fallback_latency_ps;
+  double m_fallback_bytes_per_ps;
+
+  FillCompletionHandler m_fill_handler;
+
+  std::unordered_map<uint64_t, Fill> m_fills;
+  std::unordered_map<uint64_t, uint64_t> m_sector_owner;
+  uint64_t m_next_sector = 0;
+};
+
 }  // namespace
+
+std::unique_ptr<ILhbFillEngine> make_ramulator_fill_engine(
+    IH3MemoryDevice* device, uint32_t sector_bytes, double fallback_latency_ns,
+    double fallback_bw_gbps, IH3MemoryDevice::CompletionHandler demand_handler) {
+  return std::unique_ptr<ILhbFillEngine>(
+      new RamulatorFillEngine(device, sector_bytes, fallback_latency_ns,
+                              fallback_bw_gbps, std::move(demand_handler)));
+}
 
 std::unique_ptr<IH3MemoryDevice> make_ramulator_device(const std::string& config_path,
                                                        const char* name) {

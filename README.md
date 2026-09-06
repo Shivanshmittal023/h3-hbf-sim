@@ -244,16 +244,14 @@ Read this before quoting any number from this repo.
    power under H3 is first-order: reads and writes are real, but row-command
    counts (`n_act`/`n_pre`) are derived, not measured. Power numbers are not
    publication-grade.
-2. **The Ramulator path covers demand traffic, not prefetch fills.**
-   `h3_ramulator_device.cpp` bridges Ramulator 2.1 to the backend, so with
-   `-DH3_WITH_RAMULATOR=ON` and `device_backend: ramulator` every HBM access
-   and every HBF *demand* access is timed by the real device model. But the
-   Latency Hiding Buffer still fills through `AnalyticFillEngine`, because
-   `ILhbFillEngine::start_fill()` returns a completion time synchronously and
-   Ramulator cannot supply one. With a ~99.9% LHB hit rate, that means most HBF
-   traffic is still closed-form. Closing this needs the same asynchronous
-   treatment `IH3MemoryDevice` just received.
-   `device_backend: analytic` remains the default and produced the results above.
+2. **The Ramulator path is complete but not yet exercised at scale.**
+   With `-DH3_WITH_RAMULATOR=ON` and `device_backend: ramulator`, *all* memory
+   traffic is timed by the real device model: HBM accesses, HBF demand misses,
+   and prefetch fills alike. Fills are issued as sector requests through the
+   same device as demand traffic, so the model sees them contending for the
+   same banks and rows. `device_backend: analytic` remains the default, and the
+   results quoted above were produced with it — the Ramulator path has unit
+   coverage but has not yet been run end to end on a full workload.
 3. **The HBM-only baseline is idealised.** With the stock backend every address
    is served at HBM speed, i.e. a machine with 3 TB of HBM — which cannot be
    built. It is an upper bound H3 approaches, never a target H3 beats. A real

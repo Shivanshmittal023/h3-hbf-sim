@@ -79,6 +79,14 @@ LhbConfig make_config(bool enabled = true) {
   return c;
 }
 
+// Minimal concrete base: ILhbFillEngine has pure virtuals the fake does not
+// care about. Declaring it here keeps the test body readable.
+struct LatencyHidingBufferTestEngine : public ILhbFillEngine {
+  uint64_t start_fill(uint64_t, uint64_t, uint64_t now) override { return now; }
+  uint64_t demand_latency_ps(uint64_t, uint64_t) override { return 0; }
+  const char* name() const override { return "TestEngine"; }
+};
+
 PrefetchHint hint_of(uint64_t id, uint64_t addr, uint64_t size,
                      uint64_t needed_at_ps, int layer = 0) {
   PrefetchHint h;
@@ -423,6 +431,90 @@ int main() {
     check(hr2 < hr,
           "without the interleave factor the hit rate is strictly worse");
     std::cout << "        (control, factor=1: hit rate " << hr2 << ")\n";
+  }
+
+  // -------------------------------------------------------------------------
+  section("12. Asynchronous fills (the Ramulator path, with a fake engine)");
+  {
+    // A real memory model cannot say when a fill lands at the moment it starts.
+    // This fake engine reproduces that contract without needing Ramulator, so
+    // the async path is covered by the standard C++17 test build.
+    struct FakeAsyncEngine : public LatencyHidingBufferTestEngine {
+      bool is_async() const override { return true; }
+      void set_completion_handler(FillCompletionHandler h) override {
+        handler = std::move(h);
+      }
+      bool start_fill_async(uint64_t addr, uint64_t size, uint64_t now,
+                            uint64_t token) override {
+        (void)addr; (void)size; (void)now;
+        pending.push_back(token);
+        ++started;
+        return true;
+      }
+      uint64_t start_fill(uint64_t, uint64_t, uint64_t now) override { return now; }
+      uint64_t demand_latency_ps(uint64_t, uint64_t) override { return TR_PS; }
+      const char* name() const override { return "FakeAsyncEngine"; }
+
+      // Complete the oldest outstanding fill.
+      void complete_one(uint64_t now) {
+        if (pending.empty()) return;
+        const uint64_t t = pending.front();
+        pending.erase(pending.begin());
+        if (handler) handler(t, now);
+      }
+      FillCompletionHandler handler;
+      std::vector<uint64_t> pending;
+      int started = 0;
+    };
+
+    auto cfg = make_config();
+    FakeAsyncEngine eng;
+    LatencyHidingBuffer lhb(cfg, &eng);
+
+    int fills_landed = 0;
+    int last_half = -1;
+    lhb.set_fill_complete_handler([&](int half, uint64_t) {
+      ++fills_landed;
+      last_half = half;
+    });
+
+    const uint64_t A = 0x5000;
+    lhb.issue_hint(hint_of(1, A, 40 * MB, 0));
+    lhb.tick(0);
+    check(eng.started >= 1, "an asynchronous fill was issued");
+
+    // Time passing must NOT complete an async fill -- only the callback can.
+    lhb.tick(500 * US);
+    check(lhb.half_state(0) != LhbState::Ready,
+          "time alone does not complete an async fill");
+    check_eq(lhb.stats().fills_completed, 0u, "no fills completed yet");
+
+    // An access now must coalesce onto the in-flight fill, not invent a stall.
+    auto a = lhb.access(A, 128, 500 * US);
+    check(a.outcome == LhbOutcome::MissLate, "access during an async fill is MISS_LATE");
+    check(a.waiting_on_fill, "the access reports waiting_on_fill");
+    check_eq(a.stall_ps, 0ULL, "no stall is invented while the fill is in flight");
+    check_eq(a.ready_time_ps, 0ULL, "no ready time is invented either");
+    check_eq(a.half, 0, "it names the half to wait on");
+
+    // The callback is what makes the data resident.
+    eng.complete_one(600 * US);
+    check_eq(lhb.stats().fills_completed, 1u, "the callback completes the fill");
+    check_eq(fills_landed, 1, "the fill-complete handler fired");
+    check_eq(last_half, 0, "it reported the correct half");
+    check(lhb.half_state(0) == LhbState::Ready || lhb.half_state(0) == LhbState::Serving,
+          "the half is resident after the callback");
+
+    // Now the same address is a genuine hit.
+    auto b = lhb.access(A + 4096, 128, 610 * US);
+    check(b.outcome == LhbOutcome::Hit, "after the fill lands the access hits");
+    check(!b.waiting_on_fill, "a hit never waits on a fill");
+
+    // Deferred stalls are chargeable once the true wait is known.
+    const uint64_t before = lhb.stats().total_stall_ps;
+    lhb.record_deferred_stall(100 * US);
+    check_eq(lhb.stats().total_stall_ps, before + 100 * US,
+             "record_deferred_stall() charges the real wait once known");
   }
 
   std::cout << "\n============================================================\n";

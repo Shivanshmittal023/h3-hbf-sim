@@ -285,6 +285,10 @@ LatencyHidingBuffer::LatencyHidingBuffer(const LhbConfig& config,
     m_config.max_outstanding_fills = m_config.num_buffers;
   }
   m_halves.resize(m_config.num_buffers);
+  if (m_engine && m_engine->is_async()) {
+    m_engine->set_completion_handler(
+        [this](uint64_t token, uint64_t now) { this->on_fill_complete(token, now); });
+  }
   if (m_config.enabled && m_engine == nullptr) {
     throw std::runtime_error("LatencyHidingBuffer: enabled but no fill engine supplied");
   }
@@ -355,8 +359,34 @@ void LatencyHidingBuffer::accumulate_occupancy(uint64_t now_ps) {
   m_stats.last_time_ps = std::max(m_stats.last_time_ps, now_ps);
 }
 
+void LatencyHidingBuffer::on_fill_complete(uint64_t token, uint64_t now_ps) {
+  for (size_t i = 0; i < m_halves.size(); ++i) {
+    Half& h = m_halves[i];
+    if (!h.async_fill_pending || h.fill_token != token) continue;
+    h.async_fill_pending = false;
+    h.fill_done_ps = now_ps;
+    h.state = LhbState::Ready;
+    ++m_stats.fills_completed;
+    // Let the backend release any requests parked on this half.
+    if (m_fill_complete_handler) m_fill_complete_handler(static_cast<int>(i), now_ps);
+    return;
+  }
+}
+
+void LatencyHidingBuffer::record_deferred_stall(uint64_t stall_ps) {
+  m_stats.total_stall_ps += stall_ps;
+  m_stats.max_stall_ps = std::max(m_stats.max_stall_ps, stall_ps);
+}
+
 void LatencyHidingBuffer::retire_fills(uint64_t now_ps) {
   for (auto& h : m_halves) {
+    // Asynchronous fills complete only via on_fill_complete().
+    if (h.async_fill_pending) {
+      if (h.state == LhbState::PrefetchIssued && now_ps > h.fill_start_ps) {
+        h.state = LhbState::Filling;
+      }
+      continue;
+    }
     if ((h.state == LhbState::PrefetchIssued || h.state == LhbState::Filling) &&
         now_ps >= h.fill_done_ps) {
       h.state = LhbState::Ready;
@@ -394,7 +424,20 @@ void LatencyHidingBuffer::launch_fills(uint64_t now_ps) {
     h.consumed = 0;
     h.layer = c.layer;
     h.fill_start_ps = now_ps;
-    h.fill_done_ps = m_engine->start_fill(c.next_addr, stored, now_ps);
+    if (m_engine->is_async()) {
+      // The completion time is unknown until the engine calls back. Marking a
+      // guess here would defeat the point of using a real memory model.
+      h.async_fill_pending = true;
+      h.fill_token = m_next_fill_token++;
+      h.fill_done_ps = 0;
+      if (!m_engine->start_fill_async(c.next_addr, stored, now_ps, h.fill_token)) {
+        h = Half();          // engine refused; retry on a later tick
+        break;
+      }
+    } else {
+      h.async_fill_pending = false;
+      h.fill_done_ps = m_engine->start_fill(c.next_addr, stored, now_ps);
+    }
 
     ++m_stats.fills_started;
     m_stats.bytes_prefetched += stored;
@@ -417,6 +460,7 @@ void LatencyHidingBuffer::release_half(Half& h, uint64_t now_ps) {
 
 void LatencyHidingBuffer::tick(uint64_t now_ps) {
   if (!m_config.enabled) return;
+  if (m_engine) m_engine->tick(now_ps);
   accumulate_occupancy(now_ps);
   retire_fills(now_ps);
   launch_fills(now_ps);
@@ -466,6 +510,21 @@ LhbAccess LatencyHidingBuffer::access(uint64_t addr, uint64_t size_bytes,
   // ---- Resident but the fill has not landed yet: partial hide -----------
   if (h.state == LhbState::PrefetchIssued || h.state == LhbState::Filling) {
     ++m_stats.misses_late;
+    if (h.async_fill_pending) {
+      // Coalesce onto the outstanding fill (MSHR merging). The stall length is
+      // unknown until the fill lands; the backend parks the request and calls
+      // record_deferred_stall() once it does. Issuing a fresh fetch here would
+      // double-count HBF traffic and misreport latency.
+      res.outcome = LhbOutcome::MissLate;
+      res.waiting_on_fill = true;
+      res.half = idx;
+      res.stall_ps = 0;
+      res.ready_time_ps = 0;
+      m_stats.bytes_served += size_bytes;
+      h.state = LhbState::Serving;
+      h.consumed = std::min<uint64_t>(h.stored_bytes, h.consumed + size_bytes);
+      return res;
+    }
     const uint64_t stall = h.fill_done_ps > now_ps ? (h.fill_done_ps - now_ps) : 0;
     res.outcome = LhbOutcome::MissLate;
     res.stall_ps = stall;
