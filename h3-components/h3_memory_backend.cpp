@@ -83,12 +83,21 @@ class H3MemoryBackend::DeviceBackendAdapter : public IMemoryBackend {
     return m_device ? !m_device->can_accept(is_write) : false;
   }
 
-  bool send(const H3Request& req, uint64_t local_addr,
-            uint64_t issue_time_ps) override {
+  // NOTE: this deliberately does NOT enqueue into the device.
+  //
+  // The router runs BEFORE the Latency Hiding Buffer is consulted, so
+  // enqueueing here would charge the HBF device for every request the LHB
+  // then serves from SRAM -- inflating HBF traffic by roughly the hit rate
+  // (~99.9%). It would also call the synchronous enqueue() on an asynchronous
+  // device, which is not merely inaccurate but impossible: the completion time
+  // does not exist yet.
+  //
+  // The adapter therefore only records that the device would accept the
+  // request. H3MemoryBackend::push() issues it, after the LHB has decided
+  // whether the device is involved at all.
+  bool send(const H3Request& /*req*/, uint64_t /*local_addr*/,
+            uint64_t /*issue_time_ps*/) override {
     if (!m_device) return false;
-    last_completion_ps =
-        m_device->enqueue(local_addr, req.size_bytes,
-                          req.type == ReqType::Write, issue_time_ps);
     accepted = true;
     return true;
   }
@@ -421,15 +430,43 @@ void H3MemoryBackend::push(const H3MemRequest& req) {
 
   uint64_t ready_ps = now;
 
+  // Issue to a device, honouring whether it is synchronous or asynchronous.
+  // Returns true if the request was handed to an ASYNC device, in which case
+  // it is now tracked in m_async_pending and push() must return immediately.
+  auto issue = [&](IH3MemoryDevice* dev, uint64_t local_addr,
+                   uint64_t issue_ps, uint64_t& out_ready) -> bool {
+    if (dev->is_async()) {
+      Pending ap;
+      ap.issue_ps = now;
+      ap.ready_ps = 0;              // unknown until the callback fires
+      ap.opaque = req.opaque;
+      ap.is_write = req.is_write;
+      const uint64_t token = m_next_token++;
+      if (dev->enqueue_async(local_addr, req.size_bytes, req.is_write,
+                             issue_ps, token)) {
+        m_async_pending.emplace(token, ap);
+        return true;
+      }
+      // Refused despite full() reporting space. Count it and fall through to a
+      // synchronous estimate so the request is still timed, never dropped.
+      ++m_stats.rejected_full;
+      out_ready = issue_ps;
+      return false;
+    }
+    out_ready = dev->enqueue(local_addr, req.size_bytes, req.is_write, issue_ps);
+    return false;
+  };
+
   switch (d.status) {
     case RouteStatus::RoutedHbm:
-      ready_ps = m_hbm_adapter->accepted ? m_hbm_adapter->last_completion_ps : now;
+      if (!m_hbm_adapter->accepted) { ready_ps = now; break; }
+      if (issue(m_hbm_device.get(), d.local_addr, d.issue_time_ps, ready_ps)) return;
       break;
 
     case RouteStatus::RoutedHbf: {
-      // The LHB sits between the router and the HBF device. If the tensor was
-      // prefetched, the access costs SRAM latency instead of ~20 us; the
-      // router has already charged the D2D hop in d.issue_time_ps.
+      // The LHB sits between the router and the HBF device. The device is
+      // touched ONLY on a miss -- a hit is served from SRAM and must generate
+      // no HBF traffic at all.
       const LhbAccess a = m_lhb->access(d.local_addr, r.size_bytes, d.issue_time_ps);
       if (a.waiting_on_fill) {
         // Coalesced onto a fill still in flight. No ready time exists yet;
@@ -443,14 +480,14 @@ void H3MemoryBackend::push(const H3MemRequest& req) {
         return;
       }
       if (a.outcome == LhbOutcome::Hit) {
-        // Served from SRAM: the HBF device is not touched at all.
-        ready_ps = a.ready_time_ps;
-      } else {
-        // Miss (or bypass): the request really goes to HBF.
-        ready_ps = m_hbf_adapter->accepted
-                       ? std::max(m_hbf_adapter->last_completion_ps, a.ready_time_ps)
-                       : a.ready_time_ps;
+        ready_ps = a.ready_time_ps;      // SRAM only; no device access
+        break;
       }
+      // Miss or bypass: the request really goes to HBF.
+      if (!m_hbf_adapter->accepted) { ready_ps = a.ready_time_ps; break; }
+      uint64_t dev_ready = a.ready_time_ps;
+      if (issue(m_hbf_device.get(), d.local_addr, d.issue_time_ps, dev_ready)) return;
+      ready_ps = std::max(dev_ready, a.ready_time_ps);
       break;
     }
 
@@ -483,35 +520,6 @@ void H3MemoryBackend::push(const H3MemRequest& req) {
                      "see h3_backend_rejected_full in the stats.\n";
       }
       break;
-  }
-
-  // ---- Asynchronous devices --------------------------------------------
-  // A real timing model does not know the completion time yet. Hand the
-  // request over with a token and wait for its callback; do NOT invent a
-  // ready time here.
-  IH3MemoryDevice* target =
-      (d.status == RouteStatus::RoutedHbf) ? m_hbf_device.get() : m_hbm_device.get();
-  if (is_accepted(d.status) && target->is_async()) {
-    // An LHB hit never reaches the device: it was served from SRAM.
-    const bool served_by_lhb =
-        (d.status == RouteStatus::RoutedHbf) && (ready_ps > now) &&
-        (ready_ps - now <= m_lhb->config().sram_access_latency_ps());
-    if (!served_by_lhb) {
-      Pending ap;
-      ap.issue_ps = now;
-      ap.ready_ps = 0;            // unknown until the callback fires
-      ap.opaque = req.opaque;
-      ap.is_write = req.is_write;
-      const uint64_t token = m_next_token++;
-      if (target->enqueue_async(d.local_addr, req.size_bytes, req.is_write,
-                                d.issue_time_ps, token)) {
-        m_async_pending.emplace(token, ap);
-        return;
-      }
-      // Refused despite full() reporting space: count it and fall through to
-      // the synchronous path so the request is still timed, never dropped.
-      ++m_stats.rejected_full;
-    }
   }
 
   Pending p;

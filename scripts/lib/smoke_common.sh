@@ -52,6 +52,19 @@ export ACCELSIM_DIR
 
 h3_die() { echo "ERROR: $*" >&2; exit 1; }
 
+# Ramulator builds libramulator.so into its own source directory, which is on
+# no standard loader path. Newly built binaries carry an RPATH for it (see
+# h3-components/CMakeLists.txt), but adding it here as well means binaries
+# built before that fix still run, and manual invocations work too.
+h3_setup_library_path() {
+  local ram
+  if [ -d "$H3_ROOT/ramulator2" ]; then ram="$H3_ROOT/ramulator2"; else ram="$H3_ROOT/../ramulator2"; fi
+  if [ -f "$ram/libramulator.so" ]; then
+    export LD_LIBRARY_PATH="$ram${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  fi
+}
+h3_setup_library_path
+
 # Compose a backend config for this run.
 #   $1 = output path
 #   $2 = "lhb_on" | "lhb_off"
@@ -230,8 +243,22 @@ h3_summarize() {
   local g
   g() { grep -a "^ *$1 *=" "$log" | tail -1 | sed 's/.*= *//' ; }
 
-  echo "  gpu_tot_sim_cycle     : $(g gpu_tot_sim_cycle)"
-  echo "  gpu_tot_sim_insn      : $(g gpu_tot_sim_insn)"
+  local cyc insn
+  cyc=$(g gpu_tot_sim_cycle); insn=$(g gpu_tot_sim_insn)
+  echo "  gpu_tot_sim_cycle     : ${cyc}"
+  echo "  gpu_tot_sim_insn      : ${insn}"
+
+  # H3 runs disable GPGPU-Sim's deadlock detector (HBF's 20 us read exceeds its
+  # 10 us threshold, so it fires on correct behaviour). Check forward progress
+  # here instead: an IPC far below 0.01 over a full budget means the GPU is
+  # stalled, not merely slow.
+  if [ -n "$cyc" ] && [ -n "$insn" ] && [ "$cyc" -gt 0 ] 2>/dev/null; then
+    if [ "$((insn * 1000 / cyc))" -lt 5 ]; then
+      echo "  *** WARNING: IPC < 0.005 -- the GPU made almost no forward progress."
+      echo "      Likely an unhidden HBF stall or a fill that never completed."
+      echo "      Check lhb_fills_started vs lhb_fills_completed in the log."
+    fi
+  fi
 
   # 2/3/4. H3-specific counters (absent in the HBM-only run, which is expected)
   local hbm hbf

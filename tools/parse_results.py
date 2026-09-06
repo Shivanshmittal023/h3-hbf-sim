@@ -204,7 +204,14 @@ def main():
 
     # ---- Comparison table -------------------------------------------------
     cyc_b, cyc_h = bl_stats.get("gpu_tot_sim_cycle"), h3_stats.get("gpu_tot_sim_cycle")
-    if cyc_b and cyc_h and abs(cyc_b - cyc_h) / max(cyc_b, 1) < 0.01:
+    if cyc_b and cyc_h and abs(cyc_b - cyc_h) / max(cyc_b, 1) >= 0.01:
+        print()
+        print("  WARNING: the runs used DIFFERENT cycle limits "
+              f"({fmt(cyc_b)} vs {fmt(cyc_h)}).")
+        print("        Instruction and request counts below are NOT comparable.")
+        print("        Only IPC and the ratio metrics are meaningful. Re-run both")
+        print("        with the same --cycles for a directly comparable result.")
+    elif cyc_b and cyc_h:
         print()
         print("  NOTE: both runs stopped at the same cycle limit, so 'Simulated")
         print("        cycles' is equal by construction. Read INSTRUCTIONS and IPC")
@@ -248,17 +255,30 @@ def main():
         cyc_h3 = h3_stats.get("gpu_tot_sim_cycle")
         ins_ab = ab_stats.get("gpu_tot_sim_insn")
         ins_h3 = h3_stats.get("gpu_tot_sim_insn")
-        capped = (cyc_ab and cyc_h3 and abs(cyc_ab - cyc_h3) / max(cyc_ab, 1) < 0.01)
+        same_budget = (cyc_ab and cyc_h3
+                       and abs(cyc_ab - cyc_h3) / max(cyc_ab, 1) < 0.01)
+        ipc_ab = ab_stats.get("gpu_tot_ipc")
+        ipc_h3 = h3_stats.get("gpu_tot_ipc")
         print()
-        if capped and ins_ab and ins_h3:
+        if not same_budget and cyc_ab and cyc_h3:
+            # Different cycle limits: instruction counts are NOT comparable --
+            # a longer run does more work for trivial reasons. IPC is
+            # budget-independent, so it is the only honest comparison here.
+            print(f"  WARNING: the two runs used DIFFERENT cycle limits "
+                  f"({fmt(cyc_ab)} vs {fmt(cyc_h3)}).")
+            print(f"  Instruction counts are not comparable across different "
+                  f"budgets; use IPC.")
+            if ipc_ab and ipc_h3:
+                print(f"    -> by IPC, the LHB delivers {ipc_h3 / ipc_ab:.2f}x "
+                      f"more work per cycle ({ipc_ab:.3f} -> {ipc_h3:.3f})")
+            print(f"  Re-run both with the same --cycles for a directly "
+                  f"comparable result.")
+        elif same_budget and ins_ab and ins_h3:
             print(f"  Both runs stopped at the same cycle limit ({fmt(cyc_h3)}), so"
                   f" cycles cannot")
             print(f"  distinguish them. Comparing work completed in that budget:")
             print(f"    -> the LHB delivers {ins_h3 / ins_ab:.1f}x more instructions"
                   f" ({fmt(ins_ab)} -> {fmt(ins_h3)})")
-        elif cyc_ab and cyc_h3:
-            print(f"  -> the LHB accounts for a {cyc_ab / cyc_h3:.2f}x speedup"
-                  f" on this trace")
 
     # ---- Verdict ----------------------------------------------------------
     print()

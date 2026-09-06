@@ -41,7 +41,7 @@ backend:
   #              in a build without that flag is a hard error, not a silent
   #              fallback.
   # ---------------------------------------------------------------------------
-  device_backend: analytic
+  device_backend: ramulator
 
   # Drive the LHB from the deterministic LLM layer schedule (Step 5).
   # Setting this false leaves the LHB with demand traffic only -- a useful
@@ -51,7 +51,7 @@ backend:
 
 analytic:
   # ---------------------------------------------------------------------------
-  # Parameters for device_backend: analytic.
+  # Parameters for device_backend: ramulator.
   #   HBM3e : ~350 ns loaded latency, 8 TB/s
   #   HBF   : 20 us array read (tR), 8 TB/s -- matched bandwidth is the whole
   #           premise of H3; only the LATENCY differs, by ~57x.

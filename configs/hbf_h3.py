@@ -85,6 +85,11 @@ TIMING_PRESET = HBF.register_timing_preset(
     rate=RATE_MTPS,
 )
 
+# Fail at export time, with a named parameter, rather than at simulator startup
+# with an opaque "what(): stoi" from deep inside Ramulator.
+_probe = HBF(org_preset=ORG_PRESET, timing_preset=TIMING_PRESET)
+HBF.check_int32(_probe.resolve()[1])
+
 # =============================================================================
 # CONTROLLERS -- one per HBF channel
 # =============================================================================

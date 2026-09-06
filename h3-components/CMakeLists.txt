@@ -79,6 +79,24 @@ if(H3_WITH_RAMULATOR)
     target_sources(h3components PRIVATE h3_ramulator_device.cpp)
     target_compile_definitions(h3components PUBLIC H3_WITH_RAMULATOR)
     target_link_libraries(h3components PUBLIC ramulator)
+
+    # RUNTIME LOADER PATH.
+    # Ramulator builds libramulator.so into its own SOURCE directory
+    # (LIBRARY_OUTPUT_DIRECTORY = PROJECT_SOURCE_DIR), which is on no standard
+    # search path. CMake gives build-tree binaries an RPATH automatically, but
+    # accel-sim.out is INSTALLED to bin/release, and installing strips it --
+    # so the installed binary fails at startup with
+    #     error while loading shared libraries: libramulator.so
+    #
+    # INTERFACE_LINK_OPTIONS propagates transitively, so anything that links
+    # h3components (libgpgpusim.a -> accel-sim.out) gets the RPATH without
+    # patching Accel-Sim's own CMakeLists.
+    get_target_property(_h3_ram_src ramulator SOURCE_DIR)
+    if(_h3_ram_src)
+        set_property(TARGET h3components APPEND PROPERTY
+                     INTERFACE_LINK_OPTIONS "-Wl,-rpath,${_h3_ram_src}")
+        message(STATUS "H3: embedding RPATH for libramulator.so -> ${_h3_ram_src}")
+    endif()
     # Ramulator is C++20; this library is C++17. They interoperate across the
     # IH3MemoryDevice boundary, but the Ramulator-facing translation unit must
     # be compiled as C++20.
@@ -97,7 +115,7 @@ endif()
 # so they can also run under CTest in CI.
 if(H3_BUILD_TESTS)
     enable_testing()
-    foreach(test_name test_h3_router test_lhb test_llm_scheduler test_macro_hazard)
+    foreach(test_name test_h3_router test_lhb test_llm_scheduler test_macro_hazard test_h3_backend)
         add_executable(${test_name} ../tests/${test_name}.cpp)
         target_link_libraries(${test_name} PRIVATE h3components)
         add_test(NAME ${test_name}

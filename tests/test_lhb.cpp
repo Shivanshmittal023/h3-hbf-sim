@@ -497,6 +497,16 @@ int main() {
     check_eq(a.ready_time_ps, 0ULL, "no ready time is invented either");
     check_eq(a.half, 0, "it names the half to wait on");
 
+    // A SECOND access while the SAME fill is still in flight must also wait.
+    // Reporting a hit here would be reporting data that has not arrived -- the
+    // bug that produced 4273 fake hits against 0 completed fills, and an
+    // average latency 92x too low.
+    auto a2 = lhb.access(A + 64, 128, 550 * US);
+    check(a2.outcome == LhbOutcome::MissLate,
+          "a repeat access during the same in-flight fill is still MISS_LATE");
+    check(a2.waiting_on_fill, "and it waits on the fill, rather than reporting a hit");
+    check_eq(lhb.stats().hits, 0u, "no hit is recorded while the fill is in flight");
+
     // The callback is what makes the data resident.
     eng.complete_one(600 * US);
     check_eq(lhb.stats().fills_completed, 1u, "the callback completes the fill");

@@ -18,8 +18,9 @@ HBM cannot reach those capacities at acceptable cost.
 
 H3 pairs each GPU's HBM3e with **High Bandwidth Flash (HBF)** — an SLC NAND
 stack behind an HBM-compatible interface. HBF matches HBM's bandwidth (~8 TB/s
-per GPU) at 16× the capacity, but its array read latency is **20 µs, roughly
-57,000× slower** than HBM. The architecture makes that usable through three
+per GPU) at 16× the capacity, but its array read latency is **20 µs** against
+HBM3e's ~19.5 ns row activation — about **1000× slower**, or ~57× slower than a
+typical loaded HBM access. The architecture makes that usable through three
 mechanisms, all modeled here:
 
 | Mechanism | What it does | Where |

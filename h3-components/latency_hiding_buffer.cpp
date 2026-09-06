@@ -521,7 +521,16 @@ LhbAccess LatencyHidingBuffer::access(uint64_t addr, uint64_t size_bytes,
       res.stall_ps = 0;
       res.ready_time_ps = 0;
       m_stats.bytes_served += size_bytes;
-      h.state = LhbState::Serving;
+      // CRITICAL: do NOT advance the state here.
+      //
+      // Setting Serving while the fill is still in flight makes the NEXT
+      // access to this half miss the "still filling" test above, fall through
+      // to the hit path, and be counted as a HIT on data that has not arrived.
+      // That produced 4273 fake hits against 0 completed fills, and an average
+      // latency of 46 ns in a system where a miss costs 20 us.
+      //
+      // The half becomes Ready only in on_fill_complete(). Consumption is
+      // tracked now, so the half still drains and swaps correctly once it is.
       h.consumed = std::min<uint64_t>(h.stored_bytes, h.consumed + size_bytes);
       return res;
     }

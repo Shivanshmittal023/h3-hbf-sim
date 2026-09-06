@@ -50,9 +50,50 @@ else
   echo "Copied hbf.py -> $DST"
 fi
 
-# Validate the DSL immediately. This is pure Python (no native module needed),
-# so it catches structural errors long before the C++ build would.
-cd "$ROOT/ramulator2"
+# ---------------------------------------------------------------------------
+# 1. Generate the C++ device model from the Python DSL.
+#
+# Ramulator normally runs codegen as a CMake target, but ONLY when
+# RAMULATOR_PYTHON_BINDINGS is ON. We build with it OFF (it needs nanobind and
+# Python headers we do not otherwise require), so codegen must run here.
+# Without it, src/ramulator/dram/impl/HBF.cpp never exists and the simulator
+# dies at startup with "Unknown DRAM standard: HBF".
+#
+# Codegen is pure Python -- no build, no native module.
+# ---------------------------------------------------------------------------
+cd "$ROOT/ramulator2" 2>/dev/null || cd "$ROOT/../ramulator2"
+echo "Generating C++ device models from the Python DSL..."
+PYTHONPATH=python python3 -m ramulator codegen --src-dir src/ramulator \
+    | tail -2 | sed 's/^/  /'
+
+[ -f src/ramulator/dram/impl/HBF.cpp ] || {
+  echo "ERROR: codegen did not produce src/ramulator/dram/impl/HBF.cpp" >&2
+  exit 1
+}
+
+# ---------------------------------------------------------------------------
+# 2. Add the generated file to Ramulator's build.
+#
+# src/ramulator/dram/CMakeLists.txt lists its sources EXPLICITLY, so a newly
+# generated model is not picked up automatically. Insert it next to the other
+# HBM models. Idempotent: re-running changes nothing.
+# ---------------------------------------------------------------------------
+DRAM_CMAKE="src/ramulator/dram/CMakeLists.txt"
+if grep -q "impl/HBF.cpp" "$DRAM_CMAKE"; then
+  echo "  HBF.cpp already in $DRAM_CMAKE"
+else
+  # Portable in-place edit (macOS sed and GNU sed disagree about -i).
+  awk '{ print; if ($0 ~ /impl\/HBM1\.cpp/) print "  impl/HBF.cpp" }' \
+      "$DRAM_CMAKE" > "$DRAM_CMAKE.tmp" && mv "$DRAM_CMAKE.tmp" "$DRAM_CMAKE"
+  grep -q "impl/HBF.cpp" "$DRAM_CMAKE" \
+    && echo "  added impl/HBF.cpp to $DRAM_CMAKE" \
+    || { echo "ERROR: could not add HBF.cpp to $DRAM_CMAKE" >&2; exit 1; }
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Validate the DSL. Pure Python (no native module), so it catches structural
+#    errors long before the C++ build would.
+# ---------------------------------------------------------------------------
 PYTHONPATH=python python3 - <<'PY'
 from ramulator.dram.hbf import HBF
 HBF.validate()
@@ -64,4 +105,6 @@ page = org["column"] * org["dq"] // 8
 tR_us = tim["nRCDRD"] * tim["tCK_ps"] / 1e6
 print(f"  HBF model OK: tR={tR_us:.0f}us, {planes} planes/PC, {page//1024}KB page")
 PY
-echo "Done. Next: build Ramulator (codegen runs automatically)."
+echo
+echo "Done. HBF is generated, registered and in the build."
+echo "Next: configure with -DH3_WITH_RAMULATOR=ON and build."

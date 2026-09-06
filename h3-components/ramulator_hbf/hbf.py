@@ -233,8 +233,14 @@ class HBF(DRAMStandard):
         timing_dict["nRFMab"] = 1
         timing_dict["nRFMpb"] = 1
         timing_dict["nRREFD"] = 1
-        timing_dict["nREFI"] = 2 ** 40      # never fires
-        timing_dict["nREFIpb"] = 2 ** 40    # never fires
+        # "Never fires", but it must still fit in a 32-bit int: Ramulator parses
+        # timings with std::stoi, so anything above 2^31-1 throws
+        # std::out_of_range deep inside DRAMSpec::load_config, with only
+        # "what(): stoi" to go on. tick_multiplier doubles these on export, so
+        # the exported value is 1e9 ticks -- 0.25 s of simulated time at
+        # tCK = 250 ps, i.e. never, with 2x headroom under the limit.
+        timing_dict["nREFI"] = 500_000_000
+        timing_dict["nREFIpb"] = 500_000_000
 
     @staticmethod
     def _resolve_nRTW(timing_dict, tCK_ps):
@@ -273,6 +279,25 @@ class HBF(DRAMStandard):
         preset["nWR"] = int(round(tPROG_ns * 1000 / tCK_ps))
         cls.timing_presets[name] = preset
         return name
+
+    @classmethod
+    def check_int32(cls, timing_dict):
+        """Reject timings Ramulator's std::stoi cannot parse.
+
+        Called from to_config() via validate_organization's sibling path is not
+        possible, so hbf_h3.py calls it explicitly. Failing here names the
+        offending parameter; failing in C++ gives only "what(): stoi".
+        """
+        INT32_MAX = 2 ** 31 - 1
+        limit = INT32_MAX // max(1, cls.tick_multiplier)   # value is scaled on export
+        bad = {k: v for k, v in timing_dict.items()
+               if isinstance(v, int) and v > limit}
+        if bad:
+            raise ValueError(
+                f"HBF: timing values exceed what Ramulator can parse "
+                f"(std::stoi, int32, and tick_multiplier={cls.tick_multiplier} "
+                f"doubles them on export): {bad}. Keep every timing below {limit}."
+            )
 
     @classmethod
     def validate_organization(cls, org_dict):
