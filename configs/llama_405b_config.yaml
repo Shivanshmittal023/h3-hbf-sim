@@ -1,0 +1,127 @@
+# =============================================================================
+#  llama_405b_config.yaml -- Llama 3.1 405B model description for H3
+# =============================================================================
+#  Consumed by : h3-components/llm_prefetch_scheduler.cpp (ModelConfig::from_yaml)
+#                tools/generate_synthetic_trace.py
+#  Purpose     : describes the MODEL, not the hardware. The scheduler uses it to
+#                compute every tensor's size and HBF/HBM address, and to derive
+#                the deterministic prefetch schedule.
+#
+#  NO WEIGHTS ARE EVER LOADED OR DOWNLOADED. Only publicly documented
+#  architecture parameters appear here; tensor sizes are computed analytically
+#  and used to generate synthetic memory traffic of the correct volume.
+#
+#  Unknown keys are a hard error.
+# =============================================================================
+
+model:
+  name: llama-3.1-405b
+  num_layers: 126
+  hidden_dim: 16384
+  num_attention_heads: 128
+  num_kv_heads: 8                # architectural GQA value -- see kv_cache below
+  intermediate_dim: 53248
+  vocab_size: 128256
+  head_dim: 128                  # hidden_dim / num_attention_heads
+
+  # ---------------------------------------------------------------------------
+  # WEIGHT PRECISION -- FP8, as used in the paper.
+  #
+  # VERIFIED: with these parameters the analytic parameter count is
+  #   per layer  = 2*(16384*16384)          q_proj + o_proj      = 536.9 MB
+  #              + 2*(16384*8*128)          k_proj + v_proj      =  33.6 MB
+  #              + 3*(16384*53248)          gate + up + down     =   2.62 GB
+  #              + 2*16384                  two RMSNorms         =  32.8 kB
+  #              = 3,187,703,808 B = 3.188 GB per layer
+  #   126 layers = 401.7 GB
+  #   + embedding + lm_head (2 x 128256 x 16384) = 4.2 GB
+  #   TOTAL      = 405,853,372,416 B = 405.9 B parameters at 1 B/param
+  # which reproduces the "405B" in the model name. If you change any dimension
+  # above, re-run tools/model_size_check.py to confirm the total still lands.
+  # ---------------------------------------------------------------------------
+  weight_dtype_bytes: 1          # FP8
+
+kv_cache:
+  # ---------------------------------------------------------------------------
+  # KV CACHE SHAPE -- READ THIS BEFORE CHANGING IT.
+  #
+  # Llama 3.1 405B architecturally uses GQA with 8 KV heads. However, the H3
+  # paper's stated KV occupancy (~35% of capacity at 1M tokens, ~84% at 10M)
+  # is ONLY reproducible with FULL MHA (128 heads) at FP16:
+  #
+  #   bytes/token = 2 (K,V) x layers x heads x head_dim x dtype
+  #
+  #   config                     bytes/token   1M/8GPU   10M/32GPU
+  #   -------------------------  ------------  --------  ---------
+  #   MHA 128 heads, FP16          8,257,536     32.8%      82.0%   <- paper
+  #   GQA   8 heads, FP16            516,096      2.1%       5.1%
+  #   GQA   8 heads, FP8             258,048      1.0%       2.6%
+  #
+  #   (occupancy = per-GPU KV bytes / 3 TiB HBF)
+  #
+  # The paper's numbers are therefore modeled here. Set num_cache_heads to 8 and
+  # dtype to 1 if you want the architecturally accurate GQA configuration --
+  # but then the KV cache stops being the capacity driver, and the whole
+  # motivation for a 3 TB HBF tier weakens. Which of these two you use is a
+  # substantive experimental choice, so it is explicit rather than buried.
+  # ---------------------------------------------------------------------------
+  num_cache_heads: 128           # 128 = MHA (reproduces the paper); 8 = true GQA
+  kv_dtype_bytes: 2              # FP16
+
+serving:
+  # ---------------------------------------------------------------------------
+  # Sequence composition, from the paper's experimental setup.
+  #   ISL/OSL are 1K each; the remainder of the context is a SHARED PRECOMPUTED
+  #   KV cache -- computed once and reused across requests, hence immutable and
+  #   safe to place in read-only HBF.
+  #
+  #   generated KV (ISL + OSL)      -> HBM  (written during inference)
+  #   shared precomputed KV         -> HBF  (read-only)
+  # ---------------------------------------------------------------------------
+  input_seq_len: 1024            # ISL
+  output_seq_len: 1024           # OSL
+  batch_size: 1
+
+  # Sequence length experiments. The smoke test overrides this to something tiny.
+  sequence_length: 1048576       # 1M tokens (use 10485760 for the 10M experiment)
+  num_gpus: 8                    # 8 for 1M, 32 for 10M
+  tensor_parallel_size: 8        # TP degree; weights are sharded across GPUs
+
+hardware:
+  # ---------------------------------------------------------------------------
+  # Only what the scheduler needs to convert bytes into TIME, so it knows when
+  # each tensor is needed and therefore when to issue its prefetch hint.
+  # Authoritative timing still comes from Accel-Sim + Ramulator; these values
+  # only drive hint placement.
+  # ---------------------------------------------------------------------------
+  gpu_clock_ghz: 1.98
+  aggregate_read_bandwidth_gbps: 8000.0   # 8 TB/s per GPU (HBM3e + HBF matched)
+  hbm_capacity_bytes_per_gpu: 206158430208    # 192 GiB
+  hbf_capacity_bytes_per_gpu: 3298534883328   # 3 TiB
+
+address_map:
+  # ---------------------------------------------------------------------------
+  # Must agree with configs/h3_router_config.yaml. Region-LOCAL layout:
+  #
+  #   HBF local:  [0, W)            model weights (this GPU's TP shard)
+  #               [W, W + S)        shared precomputed KV cache
+  #   HBM local:  [0, G)            generated KV cache (ISL + OSL)
+  #               [G, G + A)        activations
+  #
+  # The scheduler assigns concrete addresses; these are just the region bases,
+  # and the global address is region_base + local offset.
+  # ---------------------------------------------------------------------------
+  hbm_base_addr: 0x0
+  hbf_base_addr: 0x3000000000    # 192 GiB
+  tensor_alignment_bytes: 4096   # page-aligned tensor starts
+
+prefetch:
+  # ---------------------------------------------------------------------------
+  # Hint timing.  hint_issue_time = tensor_needed_time - lead_time - margin
+  #
+  # lead_time must cover tR (20 us) plus the transfer of one LHB half
+  # (20 MiB / 1 TB/s ~= 21 us), hence 45 us with ~4 us of slack.
+  # ---------------------------------------------------------------------------
+  lead_time_ns: 45000.0
+  safety_margin_ns: 5000.0
+  max_outstanding_hints: 8

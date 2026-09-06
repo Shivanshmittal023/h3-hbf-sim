@@ -1,0 +1,71 @@
+# =============================================================================
+#  llama_smoke.yaml -- SMALL model config for the H3 smoke test
+# =============================================================================
+#  THIS IS NOT LLAMA 3.1 405B. For the real experiment use
+#  configs/llama_405b_config.yaml.
+#
+#  WHY THIS FILE EXISTS
+#      The prefetch scheduler lays out every tensor of the configured model and
+#      issues hints for all of them. Pointing it at the 405B config while the
+#      smoke trace touches only ~36 MiB means the LHB prefetches ~1.6 GB that
+#      is never read: `lhb_prefetch_efficiency` collapses to ~0.04 and says
+#      nothing about whether prefetching works.
+#
+#      This config describes a small transformer whose HBF footprint MATCHES
+#      the synthetic trace, so prefetch efficiency becomes a real measurement.
+#
+#  FOOTPRINT (must stay close to the trace's HBF footprint)
+#      per-layer weights   = 44.0 MB  ->  5.3 MiB per GPU at TP=8
+#      4 layers            = 21.0 MiB
+#      shared KV @ seq4096 = 12.0 MiB
+#      embed + lm_head     =  4.2 MiB
+#      TOTAL HBF per GPU   ~ 37 MiB     (trace touches 35.8 MiB)
+#
+#      If you change --num_layers or --seq_length in the trace generator,
+#      re-check this footprint. scripts/lib/smoke_common.sh keeps num_layers in
+#      sync automatically; the other dimensions are fixed here.
+# =============================================================================
+
+model:
+  name: h3-smoke-transformer
+  num_layers: 4                  # overridden by the smoke runner to match the trace
+  hidden_dim: 2048
+  num_attention_heads: 16
+  num_kv_heads: 2
+  intermediate_dim: 5632
+  vocab_size: 8192
+  head_dim: 128                  # 128 * 16 == 2048 == hidden_dim (validated)
+  weight_dtype_bytes: 1          # FP8, as in the paper
+
+kv_cache:
+  # Same shape choice as the 405B config: full MHA at FP16, which is what
+  # reproduces the paper's capacity figures. See llama_405b_config.yaml for
+  # the reconciliation table.
+  num_cache_heads: 16
+  kv_dtype_bytes: 2
+
+serving:
+  input_seq_len: 512
+  output_seq_len: 512
+  batch_size: 1
+  sequence_length: 4096          # 1024 generated + 3072 shared precomputed
+  num_gpus: 8
+  tensor_parallel_size: 8
+
+hardware:
+  gpu_clock_ghz: 1.98
+  aggregate_read_bandwidth_gbps: 8000.0
+  hbm_capacity_bytes_per_gpu: 206158430208
+  hbf_capacity_bytes_per_gpu: 3298534883328
+
+address_map:
+  # MUST match configs/h3_router_config.yaml, or the scheduler will place
+  # tensors at addresses the router does not decode.
+  hbm_base_addr: 0x0
+  hbf_base_addr: 0x3000000000
+  tensor_alignment_bytes: 4096
+
+prefetch:
+  lead_time_ns: 45000.0
+  safety_margin_ns: 5000.0
+  max_outstanding_hints: 8

@@ -1,0 +1,91 @@
+# =============================================================================
+#  h3_router_config.yaml -- H3 address decoder & router configuration
+# =============================================================================
+#  Consumed by : h3-components/h3_address_router.cpp
+#                (H3RouterConfig::from_yaml)
+#  Models      : the address decoder & router in the HBM base die, H3 paper
+#                Fig. 3(b), using the address map of Fig. 3(c).
+#
+#  Every key below is OPTIONAL -- omitting one keeps the documented default.
+#  An UNKNOWN key is a hard error, so a typo can never silently do nothing.
+#
+#  Value syntax:
+#    * decimal (192) or hex (0x3000000000)
+#    * '_' digit separators allowed (3_221_225_472)
+#    * binary size suffixes: KB, MB, GB, TB   (1 GB = 1<<30)
+# =============================================================================
+
+address_map:
+  # ---------------------------------------------------------------------------
+  # HBM region -- generated KV cache and activations. Read/write.
+  # Capacity matches HBM3e per GPU in the paper's setup: 8 cubes x 24 GB.
+  # ---------------------------------------------------------------------------
+  hbm_base_addr: 0x0
+  hbm_size_bytes: 192GB          # ends at 0x3000000000
+
+  # ---------------------------------------------------------------------------
+  # HBF region -- model weights and the shared precomputed KV cache. READ-ONLY.
+  # Capacity is 16x the HBM3e capacity: 8 cubes x 384 GB = 3 TB per GPU.
+  # ---------------------------------------------------------------------------
+  hbf_base_addr: 0x3000000000    # = 192 GB, immediately after HBM
+  hbf_size_bytes: 3TB            # ends at 0x33000000000
+
+  # NOTE ON THE PAPER'S LITERAL VALUES
+  #   Fig. 3(c) prints the boundaries as 0x030000000 -> 0x1E000000000. Those
+  #   evaluate to 768 MB and ~2.06 TB, which contradict the figure's own stated
+  #   192 GB and 3 TB (hex digits appear to be missing). The defaults above are
+  #   derived from the capacities instead, so the map is self-consistent.
+  #   To reproduce the figure's literals exactly, use:
+  #       hbm_base_addr:  0x0
+  #       hbm_size_bytes: 0x030000000
+  #       hbf_base_addr:  0x030000000
+  #       hbf_size_bytes: 0x1DFD0000000
+
+d2d:
+  # ---------------------------------------------------------------------------
+  # Die-to-die interconnect between the HBM base die and the HBF base die.
+  #
+  # IMPORTANT: this is ONLY the physical routing overhead of crossing the link.
+  # It is NOT the NAND array read latency (tR = 20 us) -- that lives in the HBF
+  # Ramulator device model (see docs/hbf_model.md) and is what the Latency
+  # Hiding Buffer exists to hide. Do not conflate the two when sweeping.
+  #
+  # 25 ns is the midpoint of the 10-50 ns range typical of short-reach D2D
+  # links. At 0.125% of tR it is negligible for HBF reads; it is exposed as a
+  # parameter mainly so its irrelevance can be demonstrated rather than assumed.
+  # ---------------------------------------------------------------------------
+  hop_latency_ns: 25.0
+  hops_to_hbf: 1                 # HBM-base-die -> HBF-base-die
+
+read_only:
+  # ---------------------------------------------------------------------------
+  # HBF read-only enforcement.
+  #
+  # In H3 the HBF holds only immutable data: model weights and the shared
+  # precomputed KV cache. A write to this region means a tensor was placed in
+  # the wrong memory. The router treats it as a workload bug, not a hardware
+  # event: it is counted in h3_router_write_attempts_to_hbf, which MUST read 0
+  # in a correct run.
+  #
+  # hbf_write_policy:
+  #   reject        drop the write and report REJECTED_WRITE_TO_HBF (default)
+  #   redirect_hbm  send it to HBM instead, so a buggy workload still runs
+  #                 (still counted as a write attempt)
+  #   allow         let it reach HBF -- only for deliberate write experiments;
+  #                 note the HBF model's tPROG is 200 us
+  # ---------------------------------------------------------------------------
+  enforce_hbf_read_only: true
+  hbf_write_policy: reject
+  warn_on_hbf_write: true
+  max_warnings: 16               # cap log spam from a misplaced tensor
+
+bandwidth:
+  # ---------------------------------------------------------------------------
+  # Peak bandwidths, used ONLY as denominators for the utilisation statistics
+  # the router reports. They do not throttle anything -- actual timing comes
+  # from the Ramulator models. Values are per GPU, in GB/s.
+  #   HBM3e: 8 cubes x ~1 TB/s  = 8000 GB/s
+  #   HBF  : 8 cubes x ~1 TB/s  = 8000 GB/s  (matched by design in the paper)
+  # ---------------------------------------------------------------------------
+  hbm_peak_gbps: 8000.0
+  hbf_peak_gbps: 8000.0

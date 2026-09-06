@@ -1,0 +1,310 @@
+# ============================================================================
+#  gpgpu-sim-h3-backend.patch -- add the H3 memory backend to GPGPU-Sim
+# ============================================================================
+#  WHAT THIS DOES
+#      Adds a third memory backend alongside the two GPGPU-Sim already has.
+#      Selection follows the EXACT pattern of the existing
+#      -gpgpu_simple_dram_model option (registered at gpu-sim.cc:243,
+#      dispatched at gpu-sim.cc:2295), so both existing paths are untouched
+#      and default behaviour is bit-identical to upstream.
+#
+#          -gpgpu_memory_backend 0   default dram_t          (unchanged)
+#          -gpgpu_memory_backend 1   simple fixed-latency    (unchanged)
+#          -gpgpu_memory_backend 2   H3 (HBM + HBF + LHB)    (new)
+#
+#  WHY A PATCH RATHER THAN EDITING THE TREE
+#      gpu-simulator/gpgpu-sim/ is cloned from upstream by
+#      setup_environment.sh and is not tracked by this repository. Keeping the
+#      change as a patch means it is version-controlled here, reviewable as a
+#      diff, and `git status` in the upstream tree stays clean.
+#
+#  APPLY / REVERT
+#      ./scripts/apply_gpgpu_sim_patch.sh
+#      ./scripts/apply_gpgpu_sim_patch.sh --revert
+#      ./scripts/apply_gpgpu_sim_patch.sh --check     (dry run)
+#
+#  GENERATED, NOT HAND-WRITTEN
+#      Produced with `diff -u` from real edited sources, so the hunk offsets
+#      are correct by construction. Verified to apply cleanly against
+#      gpgpu-sim_distribution @ dev.
+# ============================================================================
+--- a/src/gpgpu-sim/gpu-sim.h
++++ b/src/gpgpu-sim/gpu-sim.h
+@@ -217,6 +217,7 @@
+     m_valid = false;
+     gpgpu_dram_timing_opt = NULL;
+     gpgpu_L2_queue_config = NULL;
++    h3_config_file = NULL;
+     gpgpu_ctx = ctx;
+   }
+   void init(const shader_core_config *shader_config = nullptr) {
+@@ -425,6 +426,11 @@
+   bool m_perf_sim_memcpy;
+   bool simple_dram_model;
+   unsigned simple_dram_clock_multiplier;
++  // H3 hybrid memory backend (HBM3e + HBF + Latency Hiding Buffer).
++  //   0 = default dram_t, 1 = simple fixed-latency model, 2 = H3
++  unsigned memory_backend;
++  // Path to the H3 backend YAML (see configs/h3_backend_config.yaml).
++  char *h3_config_file;
+   bool SST_mode;
+   bool lrc_enabled;
+   unsigned lrc_max_entries;
+--- a/src/gpgpu-sim/gpu-sim.cc
++++ b/src/gpgpu-sim/gpu-sim.cc
+@@ -31,6 +31,7 @@
+ // POSSIBILITY OF SUCH DAMAGE.
+ 
+ #include "gpu-sim.h"
++#include "h3_memory_backend.h"
+ 
+ #include <execinfo.h>
+ #include <math.h>
+@@ -248,6 +249,15 @@
+                          "clock multiplier for simple dram model (default = 1)",
+                          "1");
+   assert(simple_dram_clock_multiplier != 0);
++  option_parser_register(opp, "-gpgpu_memory_backend", OPT_UINT32,
++                         &memory_backend,
++                         "memory backend: 0 = dram_t (default), 1 = simple, "
++                         "2 = H3 hybrid HBM+HBF with latency hiding buffer",
++                         "0");
++  option_parser_register(opp, "-gpgpu_h3_config_file", OPT_CSTR,
++                         &h3_config_file,
++                         "path to the H3 memory backend YAML config",
++                         "configs/h3_backend_config.yaml");
+   option_parser_register(opp, "-gpgpu_dram_scheduler", OPT_INT32,
+                          &scheduler_type, "0 = fifo, 1 = FR-FCFS (defaul)",
+                          "1");
+@@ -1865,6 +1875,16 @@
+     }
+   }
+ 
++  // ---- H3 hybrid memory backend statistics --------------------------------
++  // One backend exists per memory partition; print ONE aggregated block rather
++  // than 80 duplicate ones, in GPGPU-Sim's `key = value` style so that
++  // util/job_launching/get_stats.py collects the counters unchanged.
++  if (m_memory_config->memory_backend == 2) {
++    std::ostringstream h3_os;
++    h3::H3MemoryBackend::print_aggregate_stats(h3_os);
++    fputs(h3_os.str().c_str(), stdout);
++  }
++
+   if (m_config.gpgpu_cflog_interval != 0) {
+     spill_log_to_file(stdout, 1, gpu_sim_cycle);
+     insn_warp_occ_print(stdout);
+@@ -2292,7 +2312,12 @@
+ 
+   if (clock_mask & DRAM) {
+     for (unsigned i = 0; i < m_memory_config->m_n_mem; i++) {
+-      if (m_memory_config->simple_dram_model)
++      // Backend dispatch. An explicit -gpgpu_memory_backend selection wins
++      // over the legacy -gpgpu_simple_dram_model flag.
++      if (m_memory_config->memory_backend == 2)
++        m_memory_partition_unit[i]->h3_dram_cycle();
++      else if (m_memory_config->memory_backend == 1 ||
++               m_memory_config->simple_dram_model)
+         m_memory_partition_unit[i]->simple_dram_model_cycle();
+       else
+         m_memory_partition_unit[i]
+--- a/src/gpgpu-sim/l2cache.h
++++ b/src/gpgpu-sim/l2cache.h
+@@ -32,6 +32,18 @@
+ #ifndef MC_PARTITION_INCLUDED
+ #define MC_PARTITION_INCLUDED
+ 
++// H3 hybrid memory backend -- FORWARD DECLARATION ONLY.
++//
++// Do NOT #include "h3_memory_backend.h" here. This header is pulled in by
++// libcuda/cuda_runtime_api.cc, and the `cuda` CMake target does not link
++// h3components, so it has no path to the H3 include directory. The member
++// below is a pointer, so a forward declaration is sufficient -- exactly how
++// `class dram_t *m_dram` is handled a few lines further down. The full header
++// is included by l2cache.cc, which builds inside the gpgpusim target.
++namespace h3 {
++class H3MemoryBackend;
++}
++
+ #include <algorithm>
+ #include <cstdint>
+ #include <deque>
+@@ -251,6 +263,7 @@
+   void cache_cycle(unsigned cycle);
+   void dram_cycle();
+   void simple_dram_model_cycle();
++  void h3_dram_cycle();  // H3 hybrid HBM + HBF backend
+ 
+   void set_done(mem_fetch *mf);
+ 
+@@ -285,6 +298,8 @@
+   class memory_stats_t *m_stats;
+   class memory_sub_partition **m_sub_partition;
+   class dram_t *m_dram;
++  // Non-null only when -gpgpu_memory_backend 2. Owned by this partition.
++  h3::H3MemoryBackend *m_h3_backend;
+ 
+   class arbitration_metadata {
+    public:
+--- a/src/gpgpu-sim/l2cache.cc
++++ b/src/gpgpu-sim/l2cache.cc
+@@ -44,6 +44,7 @@
+ #include "dram.h"
+ #include "gpu-cache.h"
+ #include "gpu-sim.h"
++#include "h3_memory_backend.h"
+ #include "histogram.h"
+ #include "l2cache.h"
+ #include "l2cache_trace.h"
+@@ -93,6 +94,20 @@
+ 
+   m_dram = new dram_t(m_id, m_config, m_stats, this, gpu);
+ 
++  // H3 backend: constructed only when selected, so the default path allocates
++  // nothing and behaves exactly as upstream.
++  m_h3_backend = NULL;
++  if (m_config->memory_backend == 2) {
++    h3::H3BackendConfig h3cfg;
++    if (m_config->h3_config_file) {
++      h3cfg = h3::H3BackendConfig::from_yaml(m_config->h3_config_file);
++    }
++    // Pass the real partition count so per-GPU quantities in the YAML
++    // (bandwidths, LHB capacity) are divided correctly. Duplicating this in
++    // the YAML would let the two drift apart silently.
++    m_h3_backend = new h3::H3MemoryBackend(m_id, h3cfg, m_config->m_n_mem);
++  }
++
+   m_sub_partition = new memory_sub_partition
+       *[m_config->m_n_sub_partition_per_memory_channel];
+   for (unsigned p = 0; p < m_config->m_n_sub_partition_per_memory_channel;
+@@ -121,6 +136,7 @@
+ 
+ memory_partition_unit::~memory_partition_unit() {
+   delete m_dram;
++  delete m_h3_backend;
+   for (unsigned p = 0; p < m_config->m_n_sub_partition_per_memory_channel;
+        p++) {
+     delete m_sub_partition[p];
+@@ -401,6 +417,84 @@
+     mem_fetch *mf = m_dram_latency_queue.front().req;
+     m_dram_latency_queue.pop_front();
+     m_dram->push(mf);
++  }
++}
++
++// ---------------------------------------------------------------------------
++// H3 hybrid memory backend cycle.
++//
++// Structurally identical to dram_cycle() above -- the same return-queue drain,
++// the same sub-partition arbitration, the same DRAM latency queue -- with
++// m_dram replaced by m_h3_backend. Keeping the shape identical is deliberate:
++// any divergence would make H3 and baseline results incomparable for reasons
++// unrelated to the memory technology.
++// ---------------------------------------------------------------------------
++void memory_partition_unit::h3_dram_cycle() {
++  // 1. Drain completed requests back to the owning sub partition.
++  mem_fetch *mf_return = (mem_fetch *)m_h3_backend->return_queue_top();
++  if (mf_return) {
++    unsigned dest_global_spid = mf_return->get_sub_partition_id();
++    int dest_spid = global_sub_partition_id_to_local_id(dest_global_spid);
++    assert(m_sub_partition[dest_spid]->get_id() == dest_global_spid);
++    if (!m_sub_partition[dest_spid]->dram_L2_queue_full()) {
++      if (mf_return->get_access_type() == L1_WRBK_ACC) {
++        m_sub_partition[dest_spid]->set_done(mf_return);
++        delete mf_return;
++      } else {
++        m_sub_partition[dest_spid]->dram_L2_queue_push(mf_return);
++        mf_return->set_status(IN_PARTITION_DRAM_TO_L2_QUEUE,
++                              m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
++        m_arbitration_metadata.return_credit(dest_spid);
++      }
++      m_h3_backend->return_queue_pop();
++    }
++  }
++
++  // 2. Advance the H3 stack by one DRAM clock.
++  m_h3_backend->cycle();
++
++  // 3. L2 -> DRAM latency queue, arbitrated across sub partitions.
++  int last_issued_partition = m_arbitration_metadata.last_borrower();
++  for (unsigned p = 0; p < m_config->m_n_sub_partition_per_memory_channel;
++       p++) {
++    int spid = (p + last_issued_partition + 1) %
++               m_config->m_n_sub_partition_per_memory_channel;
++    if (!m_sub_partition[spid]->L2_dram_queue_empty() &&
++        can_issue_to_dram(spid)) {
++      mem_fetch *mf = m_sub_partition[spid]->L2_dram_queue_top();
++      if (m_h3_backend->full(mf->is_write())) break;
++
++      m_sub_partition[spid]->L2_dram_queue_pop();
++      dram_delay_t d;
++      d.req = mf;
++      d.ready_cycle = m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle +
++                      m_config->dram_latency;
++      m_dram_latency_queue.push_back(d);
++      mf->set_status(IN_PARTITION_DRAM_LATENCY_QUEUE,
++                     m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
++      m_arbitration_metadata.borrow_credit(spid);
++      break;  // the DRAM accepts only one request per cycle
++    }
++  }
++
++  // 4. Latency queue -> H3 backend.
++  //    NOTE: full() here is a RETRY, not a drop. If the backend is full the
++  //    request stays at the head of the latency queue and is offered again on
++  //    the next cycle, exactly as dram_cycle() does with m_dram.
++  if (!m_dram_latency_queue.empty() &&
++      ((m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle) >=
++       m_dram_latency_queue.front().ready_cycle) &&
++      !m_h3_backend->full(m_dram_latency_queue.front().req->is_write())) {
++    mem_fetch *mf = m_dram_latency_queue.front().req;
++    m_dram_latency_queue.pop_front();
++
++    h3::H3MemRequest req;
++    req.addr = mf->get_addr();
++    req.is_write = mf->is_write();
++    req.size_bytes = mf->get_data_size();
++    req.opaque = (void *)mf;
++    req.source_id = (int)mf->get_sub_partition_id();
++    m_h3_backend->push(req);
+   }
+ }
+ 
+--- a/src/gpgpu-sim/CMakeLists.txt
++++ b/src/gpgpu-sim/CMakeLists.txt
+@@ -24,9 +24,36 @@
+     list(REMOVE_ITEM ${gpgpusim_SRC} power_interface.cc)
+ endif()
+ 
++# -----------------------------------------------------------------------------
++# H3 hybrid memory backend (HBM3e + HBF + Latency Hiding Buffer)
++#
++# h3-components lives in the H3 project repository, NOT in GPGPU-Sim. It has no
++# GPGPU-Sim or Ramulator dependencies, so it can also be built and unit-tested
++# on its own (see scripts/run_unit_tests.sh).
++#
++# Layout:  <h3-sim>/gpu-simulator/gpgpu-sim/src/gpgpu-sim  <- we are here
++#          <h3-sim>/h3-components                          <- four levels up
++# -----------------------------------------------------------------------------
++set(H3_COMPONENTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../h3-components"
++    CACHE PATH "Path to the H3 memory system components")
++
++if(EXISTS "${H3_COMPONENTS_DIR}/CMakeLists.txt")
++    if(NOT TARGET h3components)
++        add_subdirectory(${H3_COMPONENTS_DIR} h3-components)
++    endif()
++    message(STATUS "GPGPU-Sim: H3 memory backend ENABLED (${H3_COMPONENTS_DIR})")
++else()
++    message(FATAL_ERROR
++        "H3 components not found at ${H3_COMPONENTS_DIR}. This GPGPU-Sim tree "
++        "has the H3 backend patch applied but the component sources are "
++        "missing. Either pass -DH3_COMPONENTS_DIR=<path>, or revert the patch "
++        "with ./scripts/apply_gpgpu_sim_patch.sh --revert")
++endif()
++
+ # Create libgpgpusim.a
+ add_library(gpgpusim STATIC ${gpgpusim_SRC})
+ target_include_directories(gpgpusim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
++target_link_libraries(gpgpusim PUBLIC h3components)
+ target_include_directories(gpgpusim PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
+ 
+ if(GPGPUSIM_USE_POWER_MODEL)

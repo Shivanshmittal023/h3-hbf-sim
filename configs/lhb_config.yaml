@@ -1,0 +1,79 @@
+# =============================================================================
+#  lhb_config.yaml -- Latency Hiding Buffer configuration
+# =============================================================================
+#  Consumed by : h3-components/latency_hiding_buffer.cpp (LhbConfig::from_yaml)
+#  Models      : H3 paper Section III-C, Equation (1).
+#
+#  Unknown keys are a hard error, so a typo can never silently keep a default.
+# =============================================================================
+
+lhb:
+  # ---------------------------------------------------------------------------
+  # MASTER SWITCH.
+  #   true  -> H3 configuration: double-buffered prefetch hides HBF latency
+  #   false -> BYPASS. Every HBF access pays the full ~20 us demand latency.
+  #            This is the baseline for "what does HBF cost without the LHB",
+  #            and is what scripts/run_smoke_test_hbm_only.sh contrasts against.
+  # ---------------------------------------------------------------------------
+  enabled: true
+
+  # ---------------------------------------------------------------------------
+  # CAPACITY -- Equation (1): Capacity = 2 x BW_HBF x Latency_HBF
+  #                                    = 2 x 1 TB/s x 20 us
+  #                                    = 40 MB
+  #
+  # SCOPE: this is PER HBF CUBE, not per GPU. Eq. (1) only yields 40 MB when
+  # BW is 1 TB/s, which is the per-cube bandwidth; 8 TB/s is the per-GPU
+  # aggregate across 8 cubes. A full GPU therefore carries 8 x 40 MB = 320 MB.
+  # Sizing a single 40 MB buffer against 8 TB/s would under-provision by 8x.
+  #
+  # The buffer is self-checking: lhb_required_capacity_eq1_bytes is reported
+  # next to lhb_capacity_bytes, so a mismatch is visible in every stats dump.
+  # ---------------------------------------------------------------------------
+  #
+  # SCOPE, AGAIN: this value is divided by the number of GPGPU-Sim memory
+  # partitions at construction, so the total across partitions matches the
+  # machine being modeled. Do not pre-divide it here.
+  buffer_size_mb: 40
+  num_buffers: 2                 # 2 = double buffering (A consumed, B filling)
+
+  # ---------------------------------------------------------------------------
+  # SRAM hit latency. This is what the GPU sees when the LHB has the data --
+  # the entire point of the structure is to turn a 20000 ns access into this.
+  # ---------------------------------------------------------------------------
+  sram_access_latency_ns: 2.0
+
+  # Fills allowed in flight at once. 0 = num_buffers, which is the correct
+  # double-buffer behaviour. Raise only when experimenting with deeper
+  # buffering (num_buffers > 2).
+  max_outstanding_fills: 0
+
+prefetch:
+  # ---------------------------------------------------------------------------
+  # How far ahead of use the LLM layer scheduler (Step 5) issues hints.
+  #
+  # Must satisfy:  lead_time >= hbf_read_latency + transfer_time + margin
+  # For a 20 MB chunk at 1 TB/s:  20000 ns (tR) + 20000 ns (transfer) = 40000 ns
+  # 45000 ns therefore carries a 5 us safety margin.
+  #
+  # SENSITIVITY: this is the second most important knob after tR. Too short and
+  # hints arrive late, converting hits into MISS_LATE stalls; too long and the
+  # buffer is occupied by data that is not needed yet, throttling the stream.
+  # ---------------------------------------------------------------------------
+  prefetch_hint_lead_time_ns: 45000.0
+
+hbf:
+  # ---------------------------------------------------------------------------
+  # HBF parameters as seen BY THE LHB's analytic fill engine.
+  #
+  # IMPORTANT: these duplicate values that also live in the Ramulator HBF model
+  # (configs/hbf_h3.py). They are used only by AnalyticFillEngine, the
+  # closed-form mode used for unit tests and fast parameter sweeps. In the full
+  # simulator (Step 6) the LHB is driven by a Ramulator-backed fill engine and
+  # these two values are IGNORED -- real timing comes from the device model.
+  # Keep them in sync anyway, so sweep results are comparable across modes.
+  #
+  # bandwidth is PER CUBE (1 TB/s = 1000 GB/s), matching the capacity scope.
+  # ---------------------------------------------------------------------------
+  hbf_read_latency_ns: 20000.0   # tR = 20 us
+  hbf_bandwidth_gbps: 1000.0     # 1 TB/s per cube

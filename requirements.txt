@@ -1,0 +1,6 @@
+pyyaml
+pandas
+plotly
+kaleido
+psutil
+tqdm

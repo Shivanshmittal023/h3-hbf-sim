@@ -1,0 +1,127 @@
+# =============================================================================
+#  .gitignore -- H3 hybrid memory simulator
+# =============================================================================
+#  Principle: track SOURCE and CONFIGURATION; never track build output, large
+#  traces, or simulation results. A trace directory can reach hundreds of GB at
+#  full Llama scale, so the rules below are deliberately aggressive.
+#
+#  Verify before pushing:   git ls-files | xargs du -ch | tail -1
+# =============================================================================
+
+# ---- Build output -----------------------------------------------------------
+build/
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.d
+*.makedepend
+compile_commands.json
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile.generated
+
+# Accel-Sim / GPGPU-Sim build artifacts
+gpu-simulator/build/
+gpu-simulator/bin/
+gpu-simulator/gpgpu-sim/lib/
+gpu-simulator/gpgpu-sim/build/
+accel-sim-framework/gpu-simulator/build/
+accel-sim-framework/gpu-simulator/bin/
+accel-sim-framework/gpu-simulator/gpgpu-sim/lib/
+*.pyi
+
+# Ramulator build artifacts (ext/ is fetched by CMake at configure time)
+ramulator2/build/
+ramulator2/ext/
+ramulator2/libramulator.so
+ramulator2/python/ramulator/_ramulator*.so
+# Installed by scripts/install_hbf.sh from h3-components/ramulator_hbf/hbf.py,
+# which IS tracked. Do not track the installed copy: it would drift.
+ramulator2/python/ramulator/dram/hbf.py
+ramulator2/src/ramulator/dram/impl/HBF.cpp
+
+# ---- Traces: NEVER commit these ---------------------------------------------
+# Even the small synthetic smoke trace is regenerable in one second by
+# tools/generate_synthetic_trace.py, which IS tracked. Full Llama traces are
+# hundreds of GB.
+traces/
+hw_run/
+*.traceg
+*.tracez
+*.trace
+*.xz
+kernelslist
+kernelslist.g
+
+# ---- Simulation results -----------------------------------------------------
+results/
+sim_run*/
+gpgpu_inst_stats.txt
+perf_counter*.csv.gz
+checkpoint_files/
+*.log
+gpgpu-sim-out_*.txt
+torque_out.*.txt
+statistics-archive/
+
+# ---- Model weights: never download or commit --------------------------------
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.gguf
+weights/
+models/
+
+# ---- Large upstream checkouts ----------------------------------------------
+# Benchmarks needed only for tracing on a real GPU (324 MB); fetch with
+#   git clone https://github.com/accel-sim/gpu-app-collection
+gpu-app-collection/
+
+# ---- Docker -----------------------------------------------------------------
+*.tar
+*.tar.gz
+.docker/
+
+# ---- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# ---- Editors / OS -----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# =============================================================================
+#  Explicitly TRACKED (negated so a broad rule above cannot swallow them)
+# =============================================================================
+!h3-components/**/*.h
+!h3-components/**/*.cpp
+!h3-components/**/*.py
+!h3-components/CMakeLists.txt
+!configs/**/*.yaml
+!configs/**/*.cfg
+!configs/**/*.py
+!scripts/**/*.sh
+!tools/**/*.py
+!tests/**/*.cpp
+!docs/**/*.md
+!patches/**/*.patch
+!Dockerfile.h3sim
+!docker-compose.yml
+!README.md
+
+# pybind11, cloned by setup_environment.sh
+gpu-simulator/extern/
+accel-sim-framework/gpu-simulator/extern/

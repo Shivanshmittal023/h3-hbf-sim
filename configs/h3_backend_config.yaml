@@ -1,0 +1,101 @@
+# =============================================================================
+#  h3_backend_config.yaml -- H3 memory backend (Accel-Sim integration)
+# =============================================================================
+#  Consumed by : h3-components/h3_memory_backend.cpp (H3BackendConfig::from_yaml)
+#  Selected by : -gpgpu_memory_backend 2 -gpgpu_h3_config_file <this file>
+#
+#  This is the TOP-LEVEL H3 config. It points at the three component configs
+#  and controls how the stack is wired into GPGPU-Sim.
+#  Unknown keys are a hard error.
+# =============================================================================
+
+backend:
+  enabled: true
+
+  # ---------------------------------------------------------------------------
+  # CLOCK DOMAIN CONVERSION -- get this wrong and every latency in the system
+  # is rescaled.
+  #
+  # GPGPU-Sim ticks the memory backend from the DRAM clock domain and counts in
+  # CYCLES; every H3 component works in PICOSECONDS. This is the single
+  # conversion point. The value must match the 4th field of
+  # -gpgpu_clock_domains in the gpgpusim.config you are running.
+  #
+  #   SM90_H100 / SM90_H200 : -gpgpu_clock_domains 1980:3960:3960:3106
+  #                                                              ^^^^ DRAM MHz
+  # ---------------------------------------------------------------------------
+  dram_clock_mhz: 3106.0
+
+  # Queue depths, mirroring dram_t's request and return queues. A full()
+  # response is a RETRY signal to the memory partition, never a drop.
+  request_queue_size: 64
+  return_queue_size: 64
+
+  # ---------------------------------------------------------------------------
+  # DEVICE BACKEND
+  #   analytic   closed-form latency + bandwidth. No Ramulator needed. Use this
+  #              for bring-up, for the smoke test, and for fast parameter
+  #              sweeps where queueing detail does not change the conclusion.
+  #   ramulator  real Ramulator 2.1 device models (HBM3e and HBF). Requires the
+  #              simulator to be built with -DH3_WITH_RAMULATOR=ON; selecting it
+  #              in a build without that flag is a hard error, not a silent
+  #              fallback.
+  # ---------------------------------------------------------------------------
+  device_backend: analytic
+
+  # Drive the LHB from the deterministic LLM layer schedule (Step 5).
+  # Setting this false leaves the LHB with demand traffic only -- a useful
+  # ablation showing how much of H3's benefit comes from prefetch hints
+  # specifically, rather than from the buffer merely existing.
+  enable_prefetch_scheduler: true
+
+analytic:
+  # ---------------------------------------------------------------------------
+  # Parameters for device_backend: analytic.
+  #   HBM3e : ~350 ns loaded latency, 8 TB/s
+  #   HBF   : 20 us array read (tR), 8 TB/s -- matched bandwidth is the whole
+  #           premise of H3; only the LATENCY differs, by ~57x.
+  #
+  # BANDWIDTHS ARE PER GPU, NOT PER PARTITION.
+  # GPGPU-Sim instantiates one H3 backend per memory partition (-gpgpu_n_mem,
+  # 40 on the H100 config). The backend divides these values by the partition
+  # count it is given, so the sum across partitions equals the machine being
+  # modeled. Writing per-partition numbers here would give the simulated GPU
+  # 40x the real bandwidth -- and it would not be obvious in any single stat.
+  # The same applies to lhb.buffer_size_mb in configs/lhb_config.yaml.
+  # ---------------------------------------------------------------------------
+  hbm_latency_ns: 350.0
+  hbm_bandwidth_gbps: 8000.0     # PER GPU
+  hbf_latency_ns: 20000.0
+  hbf_bandwidth_gbps: 8000.0     # PER GPU
+
+  # ---------------------------------------------------------------------------
+  # OUTSTANDING-REQUEST LIMITS (per partition). These decide whether a device
+  # can actually reach its configured bandwidth.
+  #
+  # A device sustains bandwidth only if it can keep latency x bandwidth of data
+  # in flight. Per partition on an H100 config (200 GB/s each):
+  #     HBM :   350 ns x 200 GB/s / 32 B =    ~2,200 sector requests
+  #     HBF : 20000 ns x 200 GB/s / 32 B =  ~125,000 sector requests
+  #
+  # No memory controller has 125,000 MSHRs. That impossibility IS the argument
+  # for the Latency Hiding Buffer: it converts an unservable demand stream into
+  # a few large sequential fills. hbf_max_outstanding models the real hardware
+  # limit -- raising it models a machine that cannot be built.
+  #
+  # hbm_max_outstanding: 0 = derive from the latency-bandwidth product above.
+  # ---------------------------------------------------------------------------
+  hbf_max_outstanding: 256
+  hbm_max_outstanding: 0
+
+ramulator:
+  # Machine-generated Ramulator configs. Produce them with:
+  #   ./scripts/export_hbf_yaml.sh
+  hbm_config: configs/generated/HBM3E_H3.yaml
+  hbf_config: configs/generated/HBF_H3.yaml
+
+configs:
+  # Component configs. Paths are relative to the simulator's working directory.
+  router_config: configs/h3_router_config.yaml
+  lhb_config: configs/lhb_config.yaml
+  model_config: configs/llama_405b_config.yaml

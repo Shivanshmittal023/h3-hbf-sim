@@ -1,0 +1,6 @@
+[submodule "accel-sim-framework"]
+	path = accel-sim-framework
+	url = https://github.com/accel-sim/accel-sim-framework.git
+[submodule "ramulator2"]
+	path = ramulator2
+	url = https://github.com/CMU-SAFARI/ramulator2.git

@@ -1,0 +1,11 @@
+# gpu-app-collection (324 MB) is bind-mounted at runtime via docker-compose,
+# so there is no reason to bake it into the image layer.
+gpu-app-collection/
+# Simulation outputs / traces -- large, regenerated inside the container.
+hw_run/
+sim_run*/
+gpu-simulator/build/
+gpu-simulator/bin/
+gpu-simulator/gpgpu-sim/
+gpu-simulator/extern/
+**/.DS_Store

@@ -1,0 +1,26 @@
+services:
+  h3sim:
+    container_name: h3sim-env
+    # Accel-Sim/CUDA only ship x86-64 toolchains; on Apple Silicon this runs
+    # under Rosetta/QEMU emulation.
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: Dockerfile.h3sim
+    image: h3sim:cuda12.8-ubuntu24.04
+    working_dir: /workspace/h3-sim
+    volumes:
+      # Host h3-sim/ is the single source of truth: edits on macOS appear
+      # immediately in the container, and GPGPU-Sim / Ramulator sources cloned
+      # inside the container persist on the host.
+      - ./:/workspace/h3-sim
+    environment:
+      - CUDA_INSTALL_PATH=/usr/local/cuda
+      - PTXAS_CUDA_INSTALL_PATH=/usr/local/cuda
+      - ACCELSIM_ROOT=/workspace/h3-sim/gpu-simulator
+      - GPUAPPS_ROOT=/workspace/h3-sim/gpu-app-collection
+    # GPGPU-Sim is memory-hungry at link time; give it room beyond the 64 MB default.
+    shm_size: 2gb
+    stdin_open: true
+    tty: true
+    command: /bin/bash
