@@ -82,7 +82,7 @@ Two ways to cut the budget dramatically:
 Identical to the laptop flow, minus the emulation penalty:
 
 ```bash
-git clone --recurse-submodules <YOUR_GITHUB_REPO_URL> h3-sim
+git clone --recurse-submodules https://github.com/Shivanshmittal023/h3-hbf-sim.git h3-hbf-sim
 cd h3-sim
 docker compose build
 docker compose run --rm h3sim bash
@@ -127,7 +127,7 @@ export CUDA_INSTALL_PATH=$CUDA_HOME
 export PATH=$CUDA_INSTALL_PATH/bin:$PATH
 
 # 4. Build
-git clone --recurse-submodules <YOUR_GITHUB_REPO_URL> h3-sim && cd h3-sim
+git clone --recurse-submodules https://github.com/Shivanshmittal023/h3-hbf-sim.git h3-hbf-sim && cd h3-sim
 ./scripts/install_hbf.sh
 ./scripts/apply_gpgpu_sim_patch.sh
 source ./gpu-simulator/setup_environment.sh release

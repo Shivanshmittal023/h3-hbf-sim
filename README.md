@@ -96,7 +96,7 @@ stays clean and every modification is reviewable as a diff.
 ### 1. Build the container
 
 ```bash
-git clone --recurse-submodules <YOUR_GITHUB_REPO_URL> h3-sim
+git clone --recurse-submodules https://github.com/Shivanshmittal023/h3-hbf-sim.git h3-hbf-sim
 cd h3-sim
 docker compose build            # ~10 min
 docker compose run --rm --name h3sim-env h3sim bash
@@ -276,6 +276,17 @@ SCREAMING_CASE** — GPGPU-Sim defines 435 object-like macros including `READ` a
 `WRITE`; `tests/test_macro_hazard.cpp` guards this.
 
 ---
+
+## License
+
+This project is MIT licensed (see [LICENSE](LICENSE)).
+
+It builds on, but does not vendor, two BSD-licensed projects:
+[Accel-Sim / GPGPU-Sim](https://github.com/accel-sim/accel-sim-framework)
+(BSD-3-Clause) and [Ramulator 2.0](https://github.com/CMU-SAFARI/ramulator2)
+(MIT). Both are git submodules and are never modified in place — changes are
+applied at setup time by `scripts/apply_gpgpu_sim_patch.sh` and
+`scripts/install_hbf.sh`, so their licences and provenance stay intact.
 
 ## Citation
 
