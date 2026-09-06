@@ -69,9 +69,11 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <iosfwd>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "h3_address_router.h"
@@ -108,6 +110,29 @@ class IH3MemoryDevice {
   // Advance internal state to `now_ps` (a no-op for closed-form devices).
   virtual void tick(uint64_t /*now_ps*/) {}
 
+  // ---- Asynchronous completion ------------------------------------------
+  // Closed-form devices know the completion time at enqueue and return it from
+  // enqueue(). A real timing model does not: Ramulator delivers completions via
+  // a callback during tick(), after arbitration and queueing have played out.
+  // Devices that work that way report is_async() == true, and the backend uses
+  // enqueue_async() plus the completion handler instead of enqueue().
+  //
+  // Pretending a real model is synchronous would mean inventing a completion
+  // time at push -- which is precisely the timing the model exists to compute.
+  virtual bool is_async() const { return false; }
+
+  // `token` identifies the request; the backend maps it back to its mem_fetch.
+  using CompletionHandler = std::function<void(uint64_t token, uint64_t now_ps)>;
+  virtual void set_completion_handler(CompletionHandler /*handler*/) {}
+
+  // Returns false if the device refused the request (queue full). The caller
+  // must retry -- never drop it.
+  virtual bool enqueue_async(uint64_t /*local_addr*/, uint32_t /*size_bytes*/,
+                             bool /*is_write*/, uint64_t /*issue_time_ps*/,
+                             uint64_t /*token*/) {
+    return false;
+  }
+
   virtual const char* name() const = 0;
 
   // Counters used to populate AccelWattch's DRAM power inputs.
@@ -115,6 +140,13 @@ class IH3MemoryDevice {
   virtual uint64_t writes() const = 0;
   virtual uint64_t bytes() const = 0;
 };
+
+#ifdef H3_WITH_RAMULATOR
+// Defined in h3_ramulator_device.cpp. Wraps a Ramulator 2.1 memory system
+// (ExternalFrontEnd + IMemorySystem) behind IH3MemoryDevice.
+std::unique_ptr<IH3MemoryDevice> make_ramulator_device(const std::string& config_path,
+                                                       const char* name);
+#endif
 
 // Closed-form device: completion = max(now, next_free) + latency, with the
 // device serialised at its bandwidth. Enough to reproduce first-order
@@ -289,6 +321,8 @@ class H3MemoryBackend {
     bool is_write = false;
   };
 
+  void on_async_completion(uint64_t token, uint64_t now_ps);
+
   // Adapters letting the router push into IH3MemoryDevice instances.
   class DeviceBackendAdapter;
 
@@ -316,6 +350,12 @@ class H3MemoryBackend {
   std::unique_ptr<LLMPrefetchScheduler> m_scheduler;
 
   std::deque<Pending> m_pending;      // in flight, ordered by ready time
+  // Requests handed to an ASYNCHRONOUS device. Their completion time is not
+  // known at push, so they cannot live in the ready-time-ordered deque above;
+  // the device's callback moves them into m_async_done.
+  std::unordered_map<uint64_t, Pending> m_async_pending;
+  std::deque<Pending> m_async_done;
+  uint64_t m_next_token = 1;
   std::deque<void*> m_return_queue;   // completed, awaiting the partition
   H3BackendStats m_stats;
 };

@@ -295,6 +295,14 @@ H3MemoryBackend::H3MemoryBackend(unsigned partition_id,
   m_hbm_adapter.reset(new DeviceBackendAdapter(m_hbm_device.get(), "HBM"));
   m_hbf_adapter.reset(new DeviceBackendAdapter(m_hbf_device.get(), "HBF"));
 
+  // Asynchronous devices (Ramulator) report completions through this handler
+  // during their tick(), which happens inside our cycle().
+  auto handler = [this](uint64_t token, uint64_t now) {
+    this->on_async_completion(token, now);
+  };
+  if (m_hbm_device->is_async()) m_hbm_device->set_completion_handler(handler);
+  if (m_hbf_device->is_async()) m_hbf_device->set_completion_handler(handler);
+
   // ---- Router -----------------------------------------------------------
   H3RouterConfig rcfg;
   if (!m_config.router_config.empty()) {
@@ -359,7 +367,9 @@ bool H3MemoryBackend::devices_can_accept(bool is_write) const {
 }
 
 bool H3MemoryBackend::full(bool is_write) const {
-  if (m_pending.size() >= m_config.request_queue_size) return true;
+  if (m_pending.size() + m_async_pending.size() >= m_config.request_queue_size)
+    return true;
+  if (m_async_done.size() >= m_config.return_queue_size) return true;
   if (m_return_queue.size() >= m_config.return_queue_size) return true;
   // Device backpressure. Without this the router would reject requests that
   // the partition has already handed over, and push() would have to retire
@@ -445,6 +455,35 @@ void H3MemoryBackend::push(const H3MemRequest& req) {
       break;
   }
 
+  // ---- Asynchronous devices --------------------------------------------
+  // A real timing model does not know the completion time yet. Hand the
+  // request over with a token and wait for its callback; do NOT invent a
+  // ready time here.
+  IH3MemoryDevice* target =
+      (d.status == RouteStatus::RoutedHbf) ? m_hbf_device.get() : m_hbm_device.get();
+  if (is_accepted(d.status) && target->is_async()) {
+    // An LHB hit never reaches the device: it was served from SRAM.
+    const bool served_by_lhb =
+        (d.status == RouteStatus::RoutedHbf) && (ready_ps > now) &&
+        (ready_ps - now <= m_lhb->config().sram_access_latency_ps());
+    if (!served_by_lhb) {
+      Pending ap;
+      ap.issue_ps = now;
+      ap.ready_ps = 0;            // unknown until the callback fires
+      ap.opaque = req.opaque;
+      ap.is_write = req.is_write;
+      const uint64_t token = m_next_token++;
+      if (target->enqueue_async(d.local_addr, req.size_bytes, req.is_write,
+                                d.issue_time_ps, token)) {
+        m_async_pending.emplace(token, ap);
+        return;
+      }
+      // Refused despite full() reporting space: count it and fall through to
+      // the synchronous path so the request is still timed, never dropped.
+      ++m_stats.rejected_full;
+    }
+  }
+
   Pending p;
   p.issue_ps = now;
   p.ready_ps = std::max(ready_ps, now);
@@ -463,7 +502,30 @@ bool H3MemoryBackend::decode_region_is_hbf(uint64_t addr) const {
   return m_router->decode(addr) == MemRegion::Hbf;
 }
 
+void H3MemoryBackend::on_async_completion(uint64_t token, uint64_t now_ps) {
+  auto it = m_async_pending.find(token);
+  if (it == m_async_pending.end()) return;   // already retired, or not ours
+  Pending p = it->second;
+  m_async_pending.erase(it);
+  p.ready_ps = std::max(now_ps, p.issue_ps);
+  // Buffered rather than pushed straight to the return queue: the queue may be
+  // full, and a device callback must never block or drop a completion.
+  m_async_done.push_back(p);
+}
+
 void H3MemoryBackend::retire_ready(uint64_t now) {
+  // Async completions first -- they are already ordered by completion time.
+  while (!m_async_done.empty() &&
+         m_return_queue.size() < m_config.return_queue_size) {
+    const Pending& p = m_async_done.front();
+    const uint64_t lat = p.ready_ps - p.issue_ps;
+    m_stats.total_latency_ps += lat;
+    m_stats.max_latency_ps = std::max(m_stats.max_latency_ps, lat);
+    ++m_stats.completed;
+    m_return_queue.push_back(p.opaque);
+    m_async_done.pop_front();
+  }
+
   while (!m_pending.empty() && m_pending.front().ready_ps <= now &&
          m_return_queue.size() < m_config.return_queue_size) {
     const Pending& p = m_pending.front();

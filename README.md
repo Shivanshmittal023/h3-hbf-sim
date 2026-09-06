@@ -114,6 +114,12 @@ cmake --build ./gpu-simulator/build/release -j4      # ~30 min under emulation
 cmake --install ./gpu-simulator/build/release
 ```
 
+To use the real Ramulator device models instead of the closed-form ones, add
+`-DH3_WITH_RAMULATOR=ON` to the configure step and set
+`device_backend: ramulator` in `configs/h3_backend_config.yaml`. Ramulator is
+C++20 and fetches yaml-cpp, fmt and nanobind at configure time, so the first
+build needs network access.
+
 Use `-j4`, not `-j8` — higher parallelism under emulation is the usual OOM cause.
 
 ### 3. Verify the H3 components (seconds, no simulator needed)
@@ -238,11 +244,16 @@ Read this before quoting any number from this repo.
    power under H3 is first-order: reads and writes are real, but row-command
    counts (`n_act`/`n_pre`) are derived, not measured. Power numbers are not
    publication-grade.
-2. **The Ramulator device path is not yet exercised.** `device_backend:
-   analytic` (closed-form latency + bandwidth) is the default and what the
-   results above use. The HBF Ramulator model is written and validated, but
-   `h3_ramulator_device.cpp` remains to be written; build with
-   `-DH3_WITH_RAMULATOR=ON` once it is.
+2. **The Ramulator path covers demand traffic, not prefetch fills.**
+   `h3_ramulator_device.cpp` bridges Ramulator 2.1 to the backend, so with
+   `-DH3_WITH_RAMULATOR=ON` and `device_backend: ramulator` every HBM access
+   and every HBF *demand* access is timed by the real device model. But the
+   Latency Hiding Buffer still fills through `AnalyticFillEngine`, because
+   `ILhbFillEngine::start_fill()` returns a completion time synchronously and
+   Ramulator cannot supply one. With a ~99.9% LHB hit rate, that means most HBF
+   traffic is still closed-form. Closing this needs the same asynchronous
+   treatment `IH3MemoryDevice` just received.
+   `device_backend: analytic` remains the default and produced the results above.
 3. **The HBM-only baseline is idealised.** With the stock backend every address
    is served at HBM speed, i.e. a machine with 3 TB of HBM — which cannot be
    built. It is an upper bound H3 approaches, never a target H3 beats. A real
