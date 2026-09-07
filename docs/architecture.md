@@ -45,6 +45,20 @@ The only file that sees both worlds is `patches/gpgpu-sim-h3-backend.patch`.
 
 ---
 
+## 1b. Two ways the router decodes an address
+
+| Mode | When | How |
+|---|---|---|
+| **Fixed regions** | synthetic traces | `addr < 192 GB` → HBM, else HBF |
+| **Allocation map** | real traces | look the address up in a table of buffers built by `tools/classify_trace.py` |
+
+The second exists because a real trace's addresses (around `0x7f35ab700000`)
+fall in neither fixed region, so every request would be reported unmapped and
+the HBF path would never run. The map is a sorted vector searched by binary
+search; addresses in no known buffer (stack, local, constant) go to HBM and are
+counted separately as `unallocated_requests` so they stay visible rather than
+being silently misreported.
+
 ## 2. Life of a memory request
 
 ```
@@ -168,6 +182,8 @@ only yields 40 MB with `BW = 1 TB/s`, which is per-cube. A GPU carries
 | Starve HBF of parallelism | `ORG_PRESET: HBF_384Gb_16hi_lowpar` (32 planes < the ~40 needed) |
 | Use real Ramulator timing | build with `-DH3_WITH_RAMULATOR=ON`, set `device_backend: ramulator` |
 | Different GPU | point `BASE_CONFIG` at another `tested-cfgs/` entry; update `dram_clock_mhz` to match |
+| Run a real trace | `scripts/run_real_trace.sh <dir>` — classifies buffers, screens, then simulates |
+| Test the router on a trace with no read-only data | `classify_trace.py --hbf-traffic-target 0.5` forces a split so both paths carry traffic |
 | True GQA instead of the paper's KV shape | `num_cache_heads: 8` in `configs/llama_405b_config.yaml` |
 
 ---
@@ -198,6 +214,9 @@ which builds inside the `gpgpusim` target.
 | `test_lhb.cpp` | 56 | Eq. (1), double buffering, streaming, bypass, **address interleaving** |
 | `test_llm_scheduler.cpp` | 39 | 405B parameter count, KV occupancy vs the paper, layout, hint timing |
 | `test_macro_hazard.cpp` | 11 | identifier collisions with GPGPU-Sim's 435 macros |
+| `test_h3_backend.cpp` | 15 | assembled-system invariants: an LHB hit must generate no device traffic; per-GPU values divided across partitions |
+
+Total: **207 assertions**, all runnable without Ramulator or Accel-Sim.
 
 Plus `tools/validate_trace.py`, which re-implements the Accel-Sim trace grammar
 and its limits (`MAX_SRC`, `MAX_DST`, the version-dependent line layout) so a

@@ -48,6 +48,7 @@
 #include <cstdint>
 #include <iosfwd>
 #include <string>
+#include <vector>
 
 namespace h3 {
 
@@ -153,6 +154,25 @@ struct H3RouterConfig {
   double hbm_peak_bandwidth_gbps = 8000.0;   // 8 TB/s per GPU
   double hbf_peak_bandwidth_gbps = 8000.0;   // 8 TB/s per GPU
 
+  // ---- Allocation map (for REAL traces) ----------------------------------
+  // A real Accel-Sim trace uses whatever virtual addresses CUDA allocated
+  // (around 0x7f35ab700000), which fall in neither region above, so every
+  // request would be reported unmapped and the HBF path never exercised.
+  //
+  // When this points at a map produced by tools/classify_trace.py, the router
+  // decodes by ALLOCATION instead of by address range: each buffer the trace
+  // touches is placed in HBM or HBF according to whether the trace ever writes
+  // to it. That is H3's real placement rule, derived from the trace rather
+  // than assumed.
+  //
+  // Empty (the default) keeps the fixed-region decode, which is what the
+  // synthetic trace uses.
+  std::string allocation_map;
+
+  // Addresses in no known allocation (stack, local, constant) are small and
+  // mutable, so they belong in HBM. Counted separately so they stay visible.
+  bool unmapped_to_hbm = true;
+
   // ---- Diagnostics ----
   bool warn_on_hbf_write = true;
   uint64_t max_warnings = 16;   // cap log spam from a misplaced tensor
@@ -196,6 +216,8 @@ struct H3RouterStats {
   uint64_t backend_full_rejects = 0;
 
   uint64_t d2d_hops = 0;
+  // Requests whose address matched no allocation in the map (HBM by default).
+  uint64_t unallocated_requests = 0;
 
   // Observation window, for bandwidth utilisation.
   uint64_t first_time_ps = 0;
@@ -229,6 +251,10 @@ class H3AddressRouter {
   // Pure decode: which region owns this address, and where in it.
   // No side effects, no statistics -- safe to call from asserts and tests.
   MemRegion decode(uint64_t addr) const;
+
+  // How many allocations were loaded from the map. Zero means the router is
+  // using fixed-region decode.
+  size_t allocation_count() const { return m_allocs.size(); }
   uint64_t to_local_addr(uint64_t addr, MemRegion region) const;
 
   // Full path: decode, enforce read-only, charge D2D latency, forward to the
@@ -249,6 +275,17 @@ class H3AddressRouter {
  private:
   void note_time(uint64_t time_ps);
   void warn(const std::string& msg);
+
+  // One buffer from the allocation map, sorted by orig_addr for binary search.
+  struct Alloc {
+    uint64_t orig_addr = 0;
+    uint64_t size = 0;
+    MemRegion region = MemRegion::Hbm;
+    uint64_t local_base = 0;   // offset within its region
+  };
+  std::vector<Alloc> m_allocs;
+  const Alloc* find_alloc(uint64_t addr) const;
+  void load_allocation_map(const std::string& path);
 
   H3RouterConfig m_config;
   IMemoryBackend* m_hbm = nullptr;

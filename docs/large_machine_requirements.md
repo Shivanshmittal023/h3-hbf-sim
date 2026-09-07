@@ -177,15 +177,26 @@ TRACES_FOLDER=/scratch/$USER/h3-traces/llama405b-1M \
 ```
 
 **Getting H3's address map into the trace.** NVBit records whatever virtual
-addresses the application uses, which will *not* match the H3 map. Two options:
+addresses the application uses, which will *not* match the H3 map. **This is
+already solved** — `tools/classify_trace.py` builds an address map from the
+trace itself:
 
-1. **Remap during simulation (recommended).** Extend
-   `h3-components/llm_prefetch_scheduler` to build a tensor→region table from the
-   real allocation addresses, and have the router consult it instead of fixed
-   region bounds. Data placement then follows what the framework actually did.
-2. **Force placement at allocation.** Allocate weights and the shared KV cache
-   from a reserved high VA range matching `hbf_base_addr`. More invasive, but it
-   makes the trace self-describing.
+```bash
+python3 tools/classify_trace.py /scratch/$USER/h3-traces/llama405b-1M \
+    -o configs/generated/llama_1m_map.yaml
+```
+
+It finds every buffer the trace touches, tallies reads and writes per buffer,
+and applies H3's placement rule — large and never written goes to HBF,
+everything else to HBM. The router loads the result via
+`address_map.allocation_map` and decodes by buffer instead of by address range.
+
+For a real inference trace this should classify the weight tensors and the
+shared KV cache into HBF automatically, because the framework never writes them.
+Check the reported `traffic share to HBF` against the expectation from
+`configs/llama_405b_config.yaml`: if it is far below the ~99% the model implies,
+the framework is probably writing a buffer you expected to be read-only, and
+that is worth understanding before simulating.
 
 Either way, validate before simulating:
 

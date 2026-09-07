@@ -227,6 +227,7 @@ H3RouterConfig H3RouterConfig::from_yaml(const std::string& path) {
       "address_map.hbm_base_addr",       "address_map.hbm_size_bytes",
       "address_map.hbf_base_addr",       "address_map.hbf_size_bytes",
       "d2d.hop_latency_ns",              "d2d.hops_to_hbf",
+      "address_map.allocation_map",       "address_map.unmapped_to_hbm",
       "read_only.enforce_hbf_read_only", "read_only.hbf_write_policy",
       "read_only.warn_on_hbf_write",     "read_only.max_warnings",
       "bandwidth.hbm_peak_gbps",         "bandwidth.hbf_peak_gbps",
@@ -253,6 +254,11 @@ H3RouterConfig H3RouterConfig::from_yaml(const std::string& path) {
     c.hbf_base_addr = parse_u64("hbf_base_addr", get("address_map.hbf_base_addr"));
   if (has("address_map.hbf_size_bytes"))
     c.hbf_size_bytes = parse_u64("hbf_size_bytes", get("address_map.hbf_size_bytes"));
+
+  if (has("address_map.allocation_map"))
+    c.allocation_map = get("address_map.allocation_map");
+  if (has("address_map.unmapped_to_hbm"))
+    c.unmapped_to_hbm = parse_bool("unmapped_to_hbm", get("address_map.unmapped_to_hbm"));
 
   if (has("d2d.hop_latency_ns"))
     c.d2d_hop_latency_ns = parse_double("hop_latency_ns", get("d2d.hop_latency_ns"));
@@ -340,11 +346,96 @@ double H3RouterStats::hbf_request_fraction() const {
 // H3AddressRouter
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Allocation map
+// ---------------------------------------------------------------------------
+// Reads the file written by tools/classify_trace.py. Deliberately a small
+// hand-rolled reader for one fixed shape rather than a YAML dependency:
+//
+//   allocations:
+//     - orig_addr: 0x7f35ab700000
+//       size: 278596
+//       region: hbf
+//       h3_addr: 0x3000000000
+//
+void H3AddressRouter::load_allocation_map(const std::string& path) {
+  std::ifstream in(path);
+  if (!in) {
+    throw std::runtime_error("H3AddressRouter: cannot open allocation map: " + path +
+                             "\n  Generate it with tools/classify_trace.py");
+  }
+  Alloc cur;
+  bool have = false;
+  std::string line;
+  auto flush = [&]() {
+    if (have && cur.size) m_allocs.push_back(cur);
+    cur = Alloc();
+    have = false;
+  };
+  while (std::getline(in, line)) {
+    const std::string body = trim(strip_comment(line));
+    if (body.empty() || body == "allocations:") continue;
+    std::string kv = body;
+    if (kv.rfind("- ", 0) == 0) {           // start of a new entry
+      flush();
+      have = true;
+      kv = trim(kv.substr(2));
+    }
+    const size_t colon = kv.find(':');
+    if (colon == std::string::npos) continue;
+    const std::string k = trim(kv.substr(0, colon));
+    const std::string v = trim(kv.substr(colon + 1));
+    if (k == "orig_addr") { cur.orig_addr = parse_u64(k, v); have = true; }
+    else if (k == "size") { cur.size = parse_u64(k, v); }
+    else if (k == "region") {
+      cur.region = (v == "hbf" || v == "HBF") ? MemRegion::Hbf : MemRegion::Hbm;
+    } else if (k == "h3_addr") {
+      const uint64_t h3 = parse_u64(k, v);
+      const uint64_t base = (cur.region == MemRegion::Hbf) ? m_config.hbf_base_addr
+                                                           : m_config.hbm_base_addr;
+      cur.local_base = h3 >= base ? h3 - base : 0;
+    }
+  }
+  flush();
+
+  std::sort(m_allocs.begin(), m_allocs.end(),
+            [](const Alloc& a, const Alloc& b) { return a.orig_addr < b.orig_addr; });
+
+  // Overlapping entries would make the decode ambiguous.
+  for (size_t i = 1; i < m_allocs.size(); ++i) {
+    if (m_allocs[i].orig_addr < m_allocs[i - 1].orig_addr + m_allocs[i - 1].size) {
+      std::ostringstream os;
+      os << "H3AddressRouter: overlapping allocations in " << path << " at 0x"
+         << std::hex << m_allocs[i].orig_addr;
+      throw std::runtime_error(os.str());
+    }
+  }
+  if (m_allocs.empty()) {
+    throw std::runtime_error("H3AddressRouter: allocation map " + path +
+                             " contains no entries");
+  }
+}
+
+const H3AddressRouter::Alloc* H3AddressRouter::find_alloc(uint64_t addr) const {
+  // Binary search: last entry whose orig_addr <= addr.
+  size_t lo = 0, hi = m_allocs.size();
+  while (lo < hi) {
+    const size_t mid = (lo + hi) / 2;
+    if (m_allocs[mid].orig_addr <= addr) lo = mid + 1; else hi = mid;
+  }
+  if (lo == 0) return nullptr;
+  const Alloc& a = m_allocs[lo - 1];
+  return (addr < a.orig_addr + a.size) ? &a : nullptr;
+}
+
 H3AddressRouter::H3AddressRouter(const H3RouterConfig& config,
                                  IMemoryBackend* hbm_backend,
                                  IMemoryBackend* hbf_backend)
     : m_config(config), m_hbm(hbm_backend), m_hbf(hbf_backend) {
   m_config.validate();
+  if (!m_config.allocation_map.empty()) {
+    load_allocation_map(m_config.allocation_map);
+  }
 }
 
 void H3AddressRouter::set_backends(IMemoryBackend* hbm, IMemoryBackend* hbf) {
@@ -353,6 +444,13 @@ void H3AddressRouter::set_backends(IMemoryBackend* hbm, IMemoryBackend* hbf) {
 }
 
 MemRegion H3AddressRouter::decode(uint64_t addr) const {
+  if (!m_allocs.empty()) {
+    const Alloc* a = find_alloc(addr);
+    if (a) return a->region;
+    // Not in any known buffer: stack, local or constant memory. Small and
+    // mutable, so HBM. Reported separately via unallocated_requests.
+    return m_config.unmapped_to_hbm ? MemRegion::Hbm : MemRegion::Unmapped;
+  }
   if (addr >= m_config.hbm_base_addr && addr < m_config.hbm_end_addr()) {
     return MemRegion::Hbm;
   }
@@ -363,6 +461,11 @@ MemRegion H3AddressRouter::decode(uint64_t addr) const {
 }
 
 uint64_t H3AddressRouter::to_local_addr(uint64_t addr, MemRegion region) const {
+  if (!m_allocs.empty()) {
+    const Alloc* a = find_alloc(addr);
+    if (a) return a->local_base + (addr - a->orig_addr);
+    return 0;   // unallocated: mapped to the base of HBM
+  }
   switch (region) {
     case MemRegion::Hbm: return addr - m_config.hbm_base_addr;
     case MemRegion::Hbf: return addr - m_config.hbf_base_addr;
@@ -416,6 +519,9 @@ RouteDecision H3AddressRouter::route(const H3Request& req) {
 
   ++m_stats.requests_total;
   note_time(req.time_ps);
+  if (!m_allocs.empty() && find_alloc(req.addr) == nullptr) {
+    ++m_stats.unallocated_requests;
+  }
 
   const bool is_write = (req.type == ReqType::Write);
 
@@ -543,6 +649,8 @@ void H3AddressRouter::print_stats(std::ostream& os) const {
   os << "  h3_router_write_attempts_to_hbf   = " << s.write_attempts_to_hbf
      << (s.write_attempts_to_hbf ? "   <-- ERROR: data placement bug" : "") << "\n";
   os << "  h3_router_writes_redirected       = " << s.writes_redirected_to_hbm << "\n";
+  os << "  h3_router_allocations_loaded      = " << m_allocs.size() << "\n";
+  os << "  h3_router_unallocated_requests    = " << s.unallocated_requests << "\n";
   os << "  h3_router_unmapped_requests       = " << s.unmapped_requests
      << (s.unmapped_requests ? "   <-- ERROR: address outside H3 map" : "") << "\n";
   os << "  h3_router_backend_full_rejects    = " << s.backend_full_rejects << "\n";

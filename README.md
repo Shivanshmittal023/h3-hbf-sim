@@ -35,17 +35,22 @@ there is nothing to predict — only to schedule.
 
 ### What has been measured so far
 
-On the synthetic smoke workload (4 layers, ~36 MiB HBF footprint, 200k cycles):
+On the synthetic smoke workload (4 layers, 200k cycles), with **Ramulator
+timing the whole memory system** — HBM, HBF demand misses and prefetch fills:
 
 | Metric | Result |
 |---|---|
-| LHB hit rate | **0.9992** |
-| Work done with LHB vs without | **6.5×** more instructions in the same cycle budget |
-| Writes to read-only HBF / unmapped addresses | **0 / 0** |
+| Work done with LHB vs without | **3.0×** more instructions in the same cycle budget |
+| LHB hit rate | **0.735**, measured rather than assumed |
+| Backend average latency | **6,074 ns** against 5,829 ns predicted from the hit rate |
+| Writes to read-only HBF / unmapped / dropped requests | **0 / 0 / 0** |
 
-These validate that the pipeline is correct and that latency hiding works.
-They are **not** a reproduction of the paper's 2.69× throughput-per-watt claim —
-see [Honest limitations](#honest-limitations).
+That latency agreement matters more than any single figure: hits, misses and
+timing tell one consistent story. An earlier version reported 46 ns here, which
+was the signature of a bug (see [Honest limitations](#honest-limitations)).
+
+These validate that the pipeline is correct and that latency hiding works. They
+are **not** a reproduction of the paper's 2.69× throughput-per-watt claim.
 
 ---
 
@@ -69,8 +74,14 @@ h3-sim/
 │   ├── accel_sim_h3.cfg                 Accel-Sim overlay enabling H3
 │   └── hbf_h3.py                        Ramulator config (source of record)
 ├── tests/                      STANDALONE UNIT TESTS (no simulator needed)
-├── tools/                      trace generation, validation, result parsing
+├── tools/                      TRACE AND RESULT TOOLING
+│   ├── generate_synthetic_trace.py  builds a small H3-shaped trace locally
+│   ├── validate_trace.py            checks a trace against Accel-Sim's grammar
+│   ├── classify_trace.py            sorts a REAL trace's buffers into HBM/HBF
+│   └── parse_results.py             side-by-side comparison of runs
 ├── scripts/                    build, patch, and experiment runners
+│   ├── run_smoke_test.sh            synthetic workload (+ --no-lhb ablation)
+│   └── run_real_trace.sh            classify, screen, then simulate a real trace
 ├── patches/                    the GPGPU-Sim hook, as a reviewable diff
 ├── docs/                       architecture and large-machine setup
 ├── Dockerfile.h3sim            CUDA 12.8 / Ubuntu 24.04 build environment
@@ -167,6 +178,63 @@ number should be discarded until it is fixed.
 
 ---
 
+## Running a real trace
+
+A real Accel-Sim trace uses whatever addresses CUDA allocated (around
+`0x7f35ab700000`), which fall in **neither** H3 region. Left alone, the router
+reports every request unmapped and the HBF path never runs. That is why real
+traces cannot simply be pointed at H3.
+
+`tools/classify_trace.py` closes the gap without rewriting the trace. It finds
+which buffers the trace actually touches — by bucketing every address it sees,
+not just the declared `MemcpyHtoD` copies, which would miss output-only buffers
+— tallies reads and writes per buffer, and applies H3's real placement rule:
+
+> **large AND never written → HBF; everything else → HBM**
+
+The result is a small address map the router loads at run time
+(`address_map.allocation_map`), after which it decodes by **buffer** instead of
+by address range.
+
+```bash
+bash scripts/run_real_trace.sh <trace_dir> --cycles 100000
+```
+
+The script validates, classifies, then **screens**: if under 1% of traffic would
+reach HBF it stops and says so, because simulating such a workload measures
+nothing about H3 and can cost hours. Classification takes seconds.
+
+### Measured: no free trace suite can exercise H3
+
+Screening all eleven rodinia benchmarks already on disk:
+
+| Benchmark | HBF traffic share |
+|---|---:|
+| hotspot | 0.5% |
+| streamcluster | 0.4% |
+| backprop | 0.1% |
+| bfs, kmeans, lud, nn, nw, srad, heartwall | **0.0%** |
+
+Rodinia cannot exercise H3 — these are HPC kernels whose working sets are
+read-write (backprop is *training*, so even its weights get written). The one
+suite whose GEMM weights are genuinely read-only bulk data is CUTLASS, and it is
+**3.3 TB**. This is why the synthetic decode-step workload is the appropriate
+instrument, not a fallback.
+
+### Testing the router itself
+
+To exercise **both** router paths on a trace that lacks read-only data, force a
+split:
+
+```bash
+python3 tools/classify_trace.py <trace_dir> -o map.yaml --hbf-traffic-target 0.5
+```
+
+This sends the most-read buffers to HBF until half the traffic lands there. On
+rodinia streamcluster it produces a 55.9% / 44.1% split across real CUDA
+addresses. It is **not** a placement H3 would make — it exists to test routing,
+and the tool says so in its output. Do not quote performance from it.
+
 ## Full experiment setup (large machine)
 
 The laptop flow above proves correctness. Reproducing the paper's results needs
@@ -188,7 +256,7 @@ Summary:
 | Component | Purpose | Key parameters |
 |---|---|---|
 | **HBF memory model** (`ramulator_hbf/hbf.py`) | SLC NAND behind an HBM interface. NAND page read maps naturally onto DRAM's two-phase structure: `ACT` = array→page register (tR), `RD` = page register→bus. `Bank` = NAND plane. | `tR` (20 µs), planes/pseudo-channel (64) |
-| **H3 address router** | Decodes HBM vs HBF, charges the D2D hop, enforces HBF read-only, counts violations. | region bases/sizes, `d2d.hop_latency_ns`, `hbf_write_policy` |
+| **H3 address router** | Decodes HBM vs HBF, charges the D2D hop, enforces HBF read-only, counts violations. Two decode modes: fixed regions (synthetic traces) or an **allocation map** built from a real trace. | region bases/sizes, `d2d.hop_latency_ns`, `hbf_write_policy`, `allocation_map` |
 | **Latency Hiding Buffer** | Streaming double buffer. A half drains in 20 MB / 1 TB/s = 20 µs = tR — that identity *is* Eq. (1). | `buffer_size_mb` (40/cube), `sram_access_latency_ns`, `enabled` |
 | **LLM prefetch scheduler** | Computes every tensor's size and address analytically, then issues hints `lead_time` before use. | `lead_time_ns`, `max_outstanding_hints` |
 
@@ -209,6 +277,7 @@ approximations, sensitivity ranking).
 | `prefetch_hint_lead_time_ns` | `configs/lhb_config.yaml` | 45000 | Must exceed tR + transfer. Too short → late misses; too long → buffer pressure. |
 | `d2d.hop_latency_ns` | `configs/h3_router_config.yaml` | 25 | Physical routing only — **not** tR. |
 | `hbf_write_policy` | `configs/h3_router_config.yaml` | reject | `reject` / `redirect_hbm` / `allow`. |
+| `allocation_map` | `configs/h3_router_config.yaml` | empty | Path to a map from `classify_trace.py`. Empty keeps fixed-region decode. |
 | `hbf_max_outstanding` | `configs/h3_backend_config.yaml` | 256 | Models the MSHR limit that makes the LHB necessary. |
 | `backend.dram_clock_mhz` | `configs/h3_backend_config.yaml` | 3106 | **Must match** `-gpgpu_clock_domains` field 4, or every latency is rescaled. |
 | `num_cache_heads` | `configs/llama_405b_config.yaml` | 128 | 128 = MHA (reproduces the paper); 8 = true GQA (16× less KV). |
@@ -258,9 +327,13 @@ Read this before quoting any number from this repo.
    built. It is an upper bound H3 approaches, never a target H3 beats. A real
    capacity-constrained baseline needs multi-GPU scale-out.
 4. **The synthetic trace has no compute between memory accesses.** It is a pure
-   memory-latency stress test — the worst case for a tiered memory system. Use
-   real NVBit traces for performance conclusions.
-5. **NAND cache-read mode is not modeled.** Real NAND overlaps the next array
+   memory-latency stress test — the worst case for a tiered memory system.
+   No freely available trace suite can replace it: rodinia measures 0.0–0.5%
+   HBF traffic, and CUTLASS, the only good match, is 3.3 TB.
+5. **The smoke run is too short to reach steady state.** 200k cycles is ~64 µs,
+   about three buffer refills, so the hit rate understates what a longer run
+   would show. This is why the realistic decode-step workload matters.
+6. **NAND cache-read mode is not modeled.** Real NAND overlaps the next array
    read with the current page's data-out, roughly halving exposed tR for
    sequential streams. Omitting it makes HBF look *worse* than hardware — the
    conservative direction.

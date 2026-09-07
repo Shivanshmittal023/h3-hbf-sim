@@ -27,6 +27,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
+#include <cstdio>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -375,7 +377,47 @@ int main() {
   }
 
   // -------------------------------------------------------------------------
-  section("12. Statistics report renders");
+  section("12. Allocation map: decode by buffer, not by address range");
+  {
+    // A real trace uses addresses like 0x7f35ab700000, which fall in NEITHER
+    // fixed region. tools/classify_trace.py works out which buffers are
+    // read-only and writes a map; the router then decodes by buffer.
+    const char* path = "/tmp/h3_test_allocmap.yaml";
+    {
+      std::ofstream f(path);
+      f << "allocations:\n"
+        << "  - orig_addr: 0x7f35ab700000\n    size: 1048576\n"
+        << "    region: hbf\n    h3_addr: 0x3000000000\n"
+        << "  - orig_addr: 0x7f35ac000000\n    size: 65536\n"
+        << "    region: hbm\n    h3_addr: 0x0\n";
+    }
+    auto cfg = make_config();
+    cfg.allocation_map = path;
+    FakeBackend hbm("HBM"), hbf("HBF");
+    H3AddressRouter r(cfg, &hbm, &hbf);
+
+    check_eq(r.allocation_count(), 2u, "both allocations loaded from the map");
+    check(r.decode(0x7f35ab700000ULL) == MemRegion::Hbf,
+          "a read-only buffer decodes to HBF despite its raw address");
+    check(r.decode(0x7f35ac000000ULL) == MemRegion::Hbm,
+          "a written buffer decodes to HBM");
+    check_eq(r.to_local_addr(0x7f35ab700000ULL + 4096, MemRegion::Hbf), 4096ULL,
+             "offsets within a buffer are preserved");
+
+    // An address in no buffer (stack/local/constant) goes to HBM and is counted.
+    r.route(read_at(0x7f35ad000000ULL));
+    check_eq(r.stats().unallocated_requests, 1u,
+             "addresses outside every buffer are counted separately");
+    check_eq(r.stats().unmapped_requests, 0u,
+             "and are NOT reported as unmapped -- they are placed in HBM");
+
+    r.route(read_at(0x7f35ab700000ULL + 512));
+    check_eq(r.stats().requests_hbf, 1u, "the HBF buffer really routes to HBF");
+    std::remove(path);
+  }
+
+  // -------------------------------------------------------------------------
+  section("13. Statistics report renders");
   {
     auto cfg = make_config();
     FakeBackend hbm("HBM"), hbf("HBF");
