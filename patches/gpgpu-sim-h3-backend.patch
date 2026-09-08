@@ -29,6 +29,7 @@
 #      gpgpu-sim_distribution @ dev.
 # ============================================================================
 --- a/src/gpgpu-sim/gpu-sim.h
+--- a/src/gpgpu-sim/gpu-sim.h
 +++ b/src/gpgpu-sim/gpu-sim.h
 @@ -217,6 +217,7 @@
      m_valid = false;
@@ -271,7 +272,7 @@
  
 --- a/src/gpgpu-sim/CMakeLists.txt
 +++ b/src/gpgpu-sim/CMakeLists.txt
-@@ -24,9 +24,36 @@
+@@ -24,9 +24,50 @@
      list(REMOVE_ITEM ${gpgpusim_SRC} power_interface.cc)
  endif()
  
@@ -285,20 +286,34 @@
 +# Layout:  <h3-sim>/gpu-simulator/gpgpu-sim/src/gpgpu-sim  <- we are here
 +#          <h3-sim>/h3-components                          <- four levels up
 +# -----------------------------------------------------------------------------
-+set(H3_COMPONENTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../h3-components"
-+    CACHE PATH "Path to the H3 memory system components")
++# The depth from here to h3-components depends on how the project is laid out:
++#   development : <root>/gpu-simulator/gpgpu-sim/src/gpgpu-sim        -> 4 up
++#   released    : <root>/accel-sim-framework/gpu-simulator/...        -> 5 up
++# Search both rather than assuming one. -DH3_COMPONENTS_DIR=<path> overrides.
++set(H3_COMPONENTS_DIR "" CACHE PATH "Path to the H3 memory system components")
++if(NOT H3_COMPONENTS_DIR)
++    foreach(_h3_cand
++            "${CMAKE_CURRENT_SOURCE_DIR}/../../../../h3-components"
++            "${CMAKE_CURRENT_SOURCE_DIR}/../../../../../h3-components")
++        if(EXISTS "${_h3_cand}/CMakeLists.txt")
++            get_filename_component(H3_COMPONENTS_DIR "${_h3_cand}" ABSOLUTE)
++            break()
++        endif()
++    endforeach()
++endif()
 +
-+if(EXISTS "${H3_COMPONENTS_DIR}/CMakeLists.txt")
++if(H3_COMPONENTS_DIR AND EXISTS "${H3_COMPONENTS_DIR}/CMakeLists.txt")
 +    if(NOT TARGET h3components)
 +        add_subdirectory(${H3_COMPONENTS_DIR} h3-components)
 +    endif()
 +    message(STATUS "GPGPU-Sim: H3 memory backend ENABLED (${H3_COMPONENTS_DIR})")
 +else()
 +    message(FATAL_ERROR
-+        "H3 components not found at ${H3_COMPONENTS_DIR}. This GPGPU-Sim tree "
-+        "has the H3 backend patch applied but the component sources are "
-+        "missing. Either pass -DH3_COMPONENTS_DIR=<path>, or revert the patch "
-+        "with ./scripts/apply_gpgpu_sim_patch.sh --revert")
++        "H3 components not found. Searched four and five levels above "
++        "${CMAKE_CURRENT_SOURCE_DIR}. This GPGPU-Sim tree has the H3 backend "
++        "patch applied but the component sources are missing. Either pass "
++        "-DH3_COMPONENTS_DIR=<path-to-h3-components>, or revert the patch with "
++        "./scripts/apply_gpgpu_sim_patch.sh --revert")
 +endif()
 +
  # Create libgpgpusim.a
