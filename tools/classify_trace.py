@@ -168,9 +168,6 @@ def main():
     ap.add_argument("trace_dir")
     ap.add_argument("-o", "--output", required=True)
     ap.add_argument("--hbf-min-bytes", type=int, default=64 * 1024)
-    ap.add_argument("--write-ratio", type=float, default=0.0,
-                    help="a buffer may still go to HBF if writes are at most "
-                         "this fraction of its traffic (0.0 = never written)")
     ap.add_argument("--hbf-traffic-target", type=float, default=None,
                     help="ROUTER TEST MODE: send the most-read buffers to HBF "
                          "until this share of traffic (0-1) lands there. This "
@@ -223,7 +220,6 @@ def main():
 
     # ---- Decide which buffers belong in HBF --------------------------------
     # Default (physical): the trace never writes the buffer, and it is large.
-    # --write-ratio relaxes "never written" to "read-mostly".
     # --hbf-traffic-target overrides both. It picks the most-read buffers until
     #   the requested share of traffic lands in HBF, so that BOTH router paths
     #   carry real traffic. That is for TESTING THE ROUTER on traces that lack
@@ -244,8 +240,7 @@ def main():
     for idx, r in enumerate(ranges):
         size = r["end"] - r["start"]
         traffic = r["read"] + r["write"]
-        write_share = (r["write"] / traffic) if traffic else 1.0
-        read_only = write_share <= args.write_ratio
+        read_only = r["write"] == 0
         to_hbf = read_only and size >= args.hbf_min_bytes
         if args.hbf_traffic_target is not None:
             to_hbf = idx in forced

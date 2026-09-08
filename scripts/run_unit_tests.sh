@@ -36,4 +36,13 @@ for test_src in tests/test_*.cpp; do
   fi
 done
 
+# The LLM trace generator and the C++ prefetch scheduler independently compute
+# the same tensor layout. If they drift apart every prefetch hint points at
+# bytes the trace never reads, the hit rate silently goes to zero, and nothing
+# reports an error. Check that they still agree.
+echo "=== checking generator/scheduler layout agreement ==="
+if ! python3 "$ROOT/tools/check_layout_agreement.py"; then
+  fail=1
+fi
+
 exit $fail
