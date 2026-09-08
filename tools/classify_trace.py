@@ -141,8 +141,23 @@ def scan_kernel(path, page_bytes, pages):
                 continue    # malformed line: validate_trace.py reports these
 
 
-def merge_pages(pages, page_bytes, merge_gap):
-    """Merge adjacent/nearby touched pages into buffer-sized ranges."""
+def merge_pages(pages, page_bytes, merge_gap, split_on_write=False):
+    """Merge adjacent/nearby touched pages into buffer-sized ranges.
+
+    merge_gap exists because a real allocation shows up as several touched
+    pages with untouched holes between them; without it every hole would split
+    one buffer into many. But the gap is a GUESS at allocation boundaries, and
+    it cuts both ways: two distinct allocations closer together than merge_gap
+    are fused into one range. If one of them is written, the fused range counts
+    as written and the read-only one silently loses its HBF eligibility.
+
+    split_on_write is the diagnostic for exactly that. A page that is written
+    terminates the current run and forms its own range, so runs of read-only
+    pages survive as separate candidates no matter what they sit next to.
+    It OVER-splits (a genuinely read-write buffer becomes many ranges), so it
+    is an upper bound on HBF-eligible bytes, not a placement rule. Compare the
+    two numbers: if they agree, merging was not hiding anything.
+    """
     if not pages:
         return []
     ranges = []
@@ -150,7 +165,11 @@ def merge_pages(pages, page_bytes, merge_gap):
     for pg in sorted(pages):
         start, end = pg * page_bytes, (pg + 1) * page_bytes
         r, w = pages[pg]
-        if cur and start - cur["end"] <= merge_gap:
+        written = w > 0
+        joinable = (cur is not None
+                    and start - cur["end"] <= merge_gap
+                    and not (split_on_write and (written or cur["write"] > 0)))
+        if joinable:
             cur["end"] = end
             cur["read"] += r
             cur["write"] += w
@@ -176,6 +195,13 @@ def main():
                          "have no large read-only data.")
     ap.add_argument("--page-bytes", type=int, default=64 * 1024)
     ap.add_argument("--merge-gap", type=int, default=1024 * 1024)
+    ap.add_argument("--split-on-write", action="store_true",
+                    help="DIAGNOSTIC: break ranges at written pages so that "
+                         "read-only runs are never fused into a neighbouring "
+                         "written buffer. Reports an UPPER BOUND on "
+                         "HBF-eligible bytes. Use it to check whether "
+                         "--merge-gap is hiding read-only data; do not use it "
+                         "to produce a placement map you then quote.")
     ap.add_argument("--hbm-base", default="0x0")
     ap.add_argument("--hbf-base", default="0x3000000000")
     ap.add_argument("--align", type=int, default=4096)
@@ -206,7 +232,8 @@ def main():
         print(f"  scanning [{i}/{len(kernels)}] {k}", file=sys.stderr)
         scan_kernel(p, args.page_bytes, pages)
 
-    ranges = merge_pages(pages, args.page_bytes, args.merge_gap)
+    ranges = merge_pages(pages, args.page_bytes, args.merge_gap,
+                         split_on_write=args.split_on_write)
     if not ranges:
         print("ERROR: no memory accesses found in the trace", file=sys.stderr)
         return 1
@@ -299,6 +326,12 @@ def main():
         print("\n  NOTE: --hbf-traffic-target was used, so placement was chosen to")
         print("        exercise both router paths, NOT by H3's physical rule.")
         print("        Use this to TEST the router; do not quote its performance.")
+    if args.split_on_write:
+        print("\n  NOTE: --split-on-write was used. Ranges were broken at written")
+        print("        pages, so this is an UPPER BOUND on HBF-eligible bytes,")
+        print("        not H3's placement rule. Compare against a run without")
+        print("        the flag: if they differ, --merge-gap is fusing a")
+        print("        read-only buffer into a written neighbour.")
     if n_hbf == 0:
         print("\n  WARNING: no buffer qualified for HBF. Every access will go to HBM,")
         print("           so the H3 path will not be exercised. Try lowering")
