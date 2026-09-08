@@ -88,8 +88,9 @@ docker compose build
 docker compose run --rm h3sim bash
 
 ./scripts/install_hbf.sh
-./scripts/apply_gpgpu_sim_patch.sh
+# setup_environment.sh clones GPGPU-Sim, so it must come BEFORE the patch
 source ./gpu-simulator/setup_environment.sh release
+./scripts/apply_gpgpu_sim_patch.sh
 cmake -S ./gpu-simulator/ -B ./gpu-simulator/build/release
 cmake --build ./gpu-simulator/build/release -j$(nproc)      # ~5 min native
 cmake --install ./gpu-simulator/build/release
@@ -129,8 +130,9 @@ export PATH=$CUDA_INSTALL_PATH/bin:$PATH
 # 4. Build
 git clone --recurse-submodules https://github.com/Shivanshmittal023/h3-hbf-sim.git h3-hbf-sim && cd h3-sim
 ./scripts/install_hbf.sh
-./scripts/apply_gpgpu_sim_patch.sh
+# setup_environment.sh clones GPGPU-Sim, so it must come BEFORE the patch
 source ./gpu-simulator/setup_environment.sh release
+./scripts/apply_gpgpu_sim_patch.sh
 cmake -S ./gpu-simulator/ -B ./gpu-simulator/build/release
 cmake --build ./gpu-simulator/build/release -j$(nproc)
 cmake --install ./gpu-simulator/build/release

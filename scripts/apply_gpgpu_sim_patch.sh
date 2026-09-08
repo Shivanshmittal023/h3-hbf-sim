@@ -26,7 +26,12 @@ PATCH="$ROOT/patches/gpgpu-sim-h3-backend.patch"
 
 [ -d "$GPGPUSIM/src/gpgpu-sim" ] || {
   echo "ERROR: GPGPU-Sim not found at $GPGPUSIM" >&2
-  echo "       Run 'source ./gpu-simulator/setup_environment.sh release' first." >&2
+  echo >&2
+  echo "  GPGPU-Sim is not a submodule -- Accel-Sim CLONES it during setup, so" >&2
+  echo "  setup_environment.sh has to run before this patch can be applied:" >&2
+  echo >&2
+  echo "    source ${ACCELSIM_DIR:-<accel-sim>}/gpu-simulator/setup_environment.sh release" >&2
+  echo "    ./scripts/apply_gpgpu_sim_patch.sh" >&2
   exit 1
 }
 

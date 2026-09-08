@@ -118,9 +118,12 @@ docker compose run --rm --name h3sim-env h3sim bash
 
 ```bash
 ./scripts/install_hbf.sh                 # install the HBF model into Ramulator
-./scripts/apply_gpgpu_sim_patch.sh       # add the H3 backend hook to GPGPU-Sim
 
+# setup_environment.sh CLONES GPGPU-Sim, so it must run BEFORE the patch.
+# (GPGPU-Sim is not a submodule; Accel-Sim pulls it at setup time.)
 source ./gpu-simulator/setup_environment.sh release
+
+./scripts/apply_gpgpu_sim_patch.sh       # add the H3 backend hook to GPGPU-Sim
 cmake -S ./gpu-simulator/ -B ./gpu-simulator/build/release
 cmake --build ./gpu-simulator/build/release -j4      # ~30 min under emulation
 cmake --install ./gpu-simulator/build/release
