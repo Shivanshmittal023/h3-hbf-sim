@@ -80,9 +80,28 @@ hdr "CUDA toolkit"
 CUDA_HOME_GUESS="${CUDA_INSTALL_PATH:-${CUDA_HOME:-/usr/local/cuda}}"
 if [ -x "$CUDA_HOME_GUESS/bin/nvcc" ]; then
   NV=$("$CUDA_HOME_GUESS/bin/nvcc" --version | awk '/release/{print $6}' | tr -d 'V,')
-  if vge "$NV" 12.8; then ok "nvcc" "$NV at $CUDA_HOME_GUESS"
-  elif vge "$NV" 11.0; then warn "nvcc" "$NV -- project is built and tested on 12.8"
-  else bad "nvcc" "$NV -- too old"; fi
+  NVMAJ=${NV%%.*}
+  # A NEWER major version is not automatically compatible. GPGPU-Sim's libcuda
+  # includes internal CUDA headers (host_defines.h) that NVIDIA has said it will
+  # remove, so 13.x may simply fail to compile. Only 12.x is known-good.
+  if [ "$NVMAJ" = "12" ] && vge "$NV" 12.8; then
+    ok "nvcc" "$NV at $CUDA_HOME_GUESS"
+  elif [ "$NVMAJ" = "12" ]; then
+    warn "nvcc" "$NV -- project is built and tested on 12.8"
+  elif [ "$NVMAJ" -gt 12 ] 2>/dev/null; then
+    bad "nvcc" "$NV -- NEWER than the tested 12.8. GPGPU-Sim includes internal
+                        CUDA headers that newer toolkits remove. Install CUDA
+                        12.8 alongside and point CUDA_INSTALL_PATH at it."
+  else
+    bad "nvcc" "$NV -- too old, need 12.8"
+  fi
+  # The specific header that breaks first if the toolkit is too new.
+  if [ -f "$CUDA_HOME_GUESS/targets/x86_64-linux/include/host_defines.h" ] \
+     || [ -f "$CUDA_HOME_GUESS/include/host_defines.h" ]; then
+    ok "  host_defines.h" "present (GPGPU-Sim's libcuda needs it)"
+  else
+    bad "  host_defines.h" "MISSING -- libcuda/cuda_runtime_api.cc will not compile"
+  fi
   [ -n "${CUDA_INSTALL_PATH:-}" ] && ok "CUDA_INSTALL_PATH" "$CUDA_INSTALL_PATH" \
     || warn "CUDA_INSTALL_PATH" "unset -- export CUDA_INSTALL_PATH=$CUDA_HOME_GUESS"
 else
@@ -95,9 +114,20 @@ if command -v python3 >/dev/null; then
   vge "$PV" 3.8 && ok "python3" "$PV" || bad "python3" "$PV -- need >= 3.8"
   python3 -c "import yaml" 2>/dev/null && ok "  pyyaml" "present" \
     || warn "  pyyaml" "missing -- pip3 install pyyaml (needed by the tools)"
-  [ -f /usr/include/python${PV}/Python.h ] || \
-    ls /usr/include/python${PV}m/Python.h >/dev/null 2>&1 && ok "  Python.h" "present" \
-    || warn "  Python.h" "missing -- apt install python3-dev (pybind11 needs it)"
+  # Headers may belong to a different interpreter than the active one: a conda
+  # env can report 3.14 while python3-dev installed headers for the system 3.12.
+  # Only needed if Ramulator's Python bindings are enabled, which we build OFF.
+  if ls /usr/include/python3*/Python.h >/dev/null 2>&1; then
+    ok "  Python.h" "$(ls /usr/include/python3*/Python.h | head -1)"
+  else
+    warn "  Python.h" "not found (only needed for Ramulator's Python bindings,
+                        which this build disables)"
+  fi
+  if [ -n "${CONDA_PREFIX:-}" ]; then
+    warn "  conda env active" "$CONDA_PREFIX
+                        Run 'conda deactivate' before building: conda's
+                        libstdc++ can shadow the system one and break linking."
+  fi
 else bad "python3" "not found"; fi
 
 hdr "Libraries (headers must be present, not just the runtime)"
@@ -129,9 +159,10 @@ if [ "$CHECK_TRACING" = "1" ]; then
     ok "GPU" "$GPU (compute capability $CC)"
     case "$CC" in
       7.*|8.*|9.*) ok "  Accel-Sim SASS support" "compute $CC is decoded (Volta..Hopper)" ;;
-      10.*|12.*)   bad "  Accel-Sim SASS support" \
-                       "compute $CC is Blackwell -- ISA_Def/ stops at Hopper, so traces
-                        from this GPU cannot be decoded without a new opcode table" ;;
+      10.*|12.*)   warn "  Accel-Sim SASS support" \
+                       "compute $CC is Blackwell; ISA_Def/ stops at Hopper, so traces
+                        recorded HERE cannot be decoded. Simulation is unaffected --
+                        record traces on a Volta/Ampere/Hopper GPU instead." ;;
       *)           warn "  Accel-Sim SASS support" "compute $CC not recognised" ;;
     esac
   else
